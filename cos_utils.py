@@ -1,18 +1,20 @@
 # 配置腾讯云cos
 from qcloud_cos import CosConfig
 from qcloud_cos import CosS3Client
+from dotenv import load_dotenv
 import os
 
 # ==========================================
 # ⚠️ 腾讯云 COS 核心配置 (请替换为你自己的真实数据)
 # ==========================================
+load_dotenv()
 secret_id = os.environ.get('TENCENT_SECRET_ID')
 secret_key = os.environ.get('TENCENT_SECRET_KEY')
 REGION = 'ap-chengdu'  # 替换为存储桶地域
 BUCKET = 'images-1408449839'  # 替换存储桶完整名称
 
 # 初始化 COS 客户端
-config = CosConfig(Region=REGION, SecretId=SECRET_ID, SecretKey=SECRET_KEY)
+config = CosConfig(Region=REGION, SecretId=secret_id, SecretKey=secret_key)
 client = CosS3Client(config)
 
 def upload_file_to_cos(file_bytes: bytes, file_name: str) -> str:
