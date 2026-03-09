@@ -44,11 +44,11 @@ def build_inference_model():
     model = tv_models.mobilenet_v3_large(weights=None) # 推理时不需要下预训练权重
     in_features = model.classifier[0].in_features
     model.classifier = nn.Sequential(
-        nn.Linear(in_features, 1024),
-        nn.BatchNorm1d(1024),
+        nn.Linear(in_features, 512),
+        nn.BatchNorm1d(512),
         nn.Hardswish(),
-        nn.Dropout(0.3),
-        nn.Linear(1024, 4) # num_classes = 4
+        nn.Dropout(0.5),
+        nn.Linear(512, 4) # num_classes = 4
     )
     return model
 
@@ -56,7 +56,7 @@ def build_inference_model():
 ai_model = build_inference_model()
 try:
     # 替换为你实际的权重路径
-    ai_model.load_state_dict(torch.load("weights/best_mobilenetv3.pth", map_location=device))
+    ai_model.load_state_dict(torch.load("weights/best_mobilenetv3.pth", map_location=device, weights_only=True))
     ai_model.to(device)
     ai_model.eval() # 切换到评估模式，关闭 Dropout 和 BatchNorm 的动态更新
     print("AI 模型权重加载成功！")
@@ -205,6 +205,62 @@ async def recognize_garbage(
     return {
         "code": 200,
         "message": "图片上传成功！AI识别完成",
+        "data": mock_result
+    }
+
+# ==========================================
+# 接口：端云协同架构专用 (手机端已完成计算，仅上传结果存历史)
+# ==========================================
+@app.post("/api/recognize/edge")
+async def recognize_garbage_edge(
+        user_id: int = Form(..., description="当前用户的ID"),
+        predicted_idx: int = Form(..., description="手机端算出来的模型索引(0/1/2/3)"),
+        confidence: float = Form(..., description="手机端算出来的置信度"),
+        file: UploadFile = File(..., description="用户上传的原图，存入COS备用"),
+        db: Session = Depends(get_db)
+):
+    # 1. 保存图片到腾讯云 COS
+    file_ext = file.filename.split(".")[-1]
+    new_filename = f"images/edge_temp/{uuid.uuid4().hex}.{file_ext}"
+    file_bytes = await file.read()
+    cos_image_url = upload_file_to_cos(file_bytes, new_filename)
+
+    if not cos_image_url:
+        return {"code": 500, "message": "图片上传云端失败，请稍后重试"}
+
+    # 2. 直接转换手机传来的 ID 并查数据库 (⚡️ 后端完全不吃显卡算力了！)
+    predicted_category_id = MODEL_IDX_TO_DB_ID.get(predicted_idx, 4)
+    category_info = db.query(models.GarbageCategory).filter(models.GarbageCategory.id == predicted_category_id).first()
+
+    if not category_info:
+        return {"code": 500, "message": "分类数据查询异常"}
+
+    # 3. 存入历史记录表，用于后续在小程序里展示，以及供数据飞轮重训
+    new_history = models.RecognizeHistory(
+        user_id=user_id,
+        image_url=cos_image_url,
+        recognized_name=category_info.category_name,
+        category_type=category_info.id,
+        confidence=confidence
+    )
+    db.add(new_history)
+    db.commit()
+
+    # 4. 组装结果返回给前端展示
+    mock_result = {
+        "user_id": user_id,
+        "image_path": cos_image_url,
+        "confidence": confidence,
+        "category_id": category_info.id,
+        "category_name": category_info.category_name,
+        "category_class": category_info.category_class,
+        "eco_value": category_info.eco_value,
+        "put_guidance": category_info.put_guidance
+    }
+
+    return {
+        "code": 200,
+        "message": "端云协同处理成功",
         "data": mock_result
     }
 
@@ -683,3 +739,75 @@ async def delete_feedback_history(item_id: int, db: Session = Depends(get_db)):
     db.query(models.Feedback).filter(models.Feedback.id == item_id).delete()
     db.commit()
     return {"code": 200, "message": "删除成功"}
+
+
+import os
+import requests
+import uuid
+
+
+# ==========================================
+# 管理员接口：自动同步纠错反馈到训练集 (数据飞轮)
+# ==========================================
+@app.get("/api/admin/sync_feedback")
+async def sync_feedback_to_dataset(db: Session = Depends(get_db)):
+    """
+    扫描所有状态为“待处理”的图片纠错反馈，
+    将错题图片自动下载并归类到本地的 train 文件夹中。
+    """
+    # 查找所有待处理的图片反馈
+    feedbacks = db.query(models.Feedback).filter(
+        models.Feedback.type == 'image',
+        models.Feedback.status == 0
+    ).all()
+
+    if not feedbacks:
+        return {"code": 200, "message": "暂无需要同步的新反馈数据"}
+
+    # 映射表：将中文分类映射到你的训练集文件夹名
+    category_to_folder = {
+        "厨余垃圾": "0",
+        "可回收物": "1",
+        "有害垃圾": "2",
+        "其他垃圾": "3"
+    }
+
+    base_train_dir = "./train"
+    os.makedirs(base_train_dir, exist_ok=True)
+
+    saved_count = 0
+
+    for fb in feedbacks:
+        # 模糊匹配分类名 (解决 "有害垃圾 (实际物品：药膏)" 匹配失败的问题)
+        target_folder = None
+        if fb.suggestion:
+            for key, val in category_to_folder.items():
+                if key in fb.suggestion:
+                    target_folder = val
+                    break
+
+        # 防御性编程，如果不是 http 开头的公网链接，直接跳过，防止程序崩溃
+        if not target_folder or not fb.image_url or not fb.image_url.startswith("http"):
+            print(f"跳过无效记录 ID:{fb.id} -> 目录:{target_folder}, URL:{fb.image_url}")
+            continue
+
+        target_dir = os.path.join(base_train_dir, target_folder)
+        os.makedirs(target_dir, exist_ok=True)
+
+        try:
+            # 下载错题图片
+            img_data = requests.get(fb.image_url).content
+            file_name = f"feedback_{fb.id}_{uuid.uuid4().hex[:8]}.jpg"
+            file_path = os.path.join(target_dir, file_name)
+
+            with open(file_path, "wb") as f:
+                f.write(img_data)
+
+            # 更新反馈状态为 1 (已采纳)
+            fb.status = 1
+            saved_count += 1
+        except Exception as e:
+            print(f"下载图片失败 {fb.image_url}: {e}")
+
+    db.commit()
+    return {"code": 200, "message": f"飞轮运转！成功将 {saved_count} 张错题照片同步到了训练集。"}
