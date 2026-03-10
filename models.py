@@ -45,7 +45,7 @@ class GarbageItem(Base):
     image_url = Column(String(255), nullable=True, comment="物品示意图链接") # 👈 新增这一行
     tips = Column(String(255), nullable=True, comment="投放提示")
     created_at = Column(DateTime, server_default=func.now())
-
+    sub_category = Column(String(50), default="其他类")
 
 # --- 3. 识别历史记录表 ---
 class RecognizeHistory(Base):

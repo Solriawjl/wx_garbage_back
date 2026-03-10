@@ -307,25 +307,100 @@ async def search_garbage(
         "data": result_data
     }
 
+
+# ==========================================
+# 搜索输入时的实时联想 (Auto-Suggest)
+# ==========================================
+@app.get("/api/search/suggest")
+async def suggest_garbage(
+        keyword: str = Query(..., description="用户正在输入的关键词"),
+        db: Session = Depends(get_db)
+):
+    if not keyword.strip():
+        return {"code": 200, "data": []}
+
+    # 在数据库中模糊匹配，限制最多返回 10 条结果，防止数据过大
+    items = db.query(models.GarbageItem).filter(
+        models.GarbageItem.item_name.like(f"%{keyword}%")
+    ).limit(10).all()
+
+    # 只提取物品名称，组装成简单的纯文本列表
+    suggest_list = [item.item_name for item in items]
+
+    return {
+        "code": 200,
+        "message": "获取联想词成功",
+        "data": suggest_list
+    }
+
+# ==========================================
+# 动态获取“热门搜索”（从知识库随机推流）
+# ==========================================
+@app.get("/api/search/hot")
+async def get_hot_searches(db: Session = Depends(get_db)):
+    """
+    每次调用，从 GarbageItem 物品总库中随机抽出 6 个具体的物品名称作为热搜。
+    既保证了每次打开页面都有新鲜感，又绝对保证搜出来的词在数据库里有完美的科普结果。
+    """
+    try:
+        # 使用 func.rand() 在 MySQL 中随机排序并取前 6 条
+        random_items = db.query(models.GarbageItem).order_by(func.rand()).limit(6).all()
+        hot_list = [item.item_name for item in random_items]
+
+        # 完美的兜底机制：万一数据库被清空了，用默认词顶上
+        if len(hot_list) < 6:
+            default_hot = ['塑料瓶', '废电池', '过期感冒药', '大骨头', '外卖包装', '碎玻璃']
+            for item in default_hot:
+                if len(hot_list) >= 6:
+                    break
+                if item not in hot_list:
+                    hot_list.append(item)
+
+        return {
+            "code": 200,
+            "message": "获取热搜成功",
+            "data": hot_list
+        }
+    except Exception as e:
+        print(f"获取热搜异常: {e}")
+        return {
+            "code": 200,
+            "message": "兜底热搜",
+            "data": ['塑料瓶', '废电池', '过期感冒药', '大骨头', '外卖包装', '碎玻璃']
+        }
+
 # ==========================================
 # 接口：知识库 - 根据大类获取下属物品列表
 # ==========================================
 @app.get("/api/knowledge/items")
 async def get_knowledge_items(
-    category_type: int = Query(..., description="大类ID: 1-可回收, 2-有害, 3-厨余, 4-其他"),
-    db: Session = Depends(get_db)
+        category_type: int = Query(..., description="大类ID: 1-可回收, 2-有害, 3-厨余, 4-其他"),
+        db: Session = Depends(get_db)
 ):
     items = db.query(models.GarbageItem).filter(
         models.GarbageItem.category_type == category_type
     ).all()
 
-    result_list = []
+    # 1. 创建一个字典，按 sub_category 进行分组
+    grouped_dict = {}
     for item in items:
-        result_list.append({
+        sub = item.sub_category or "其他类"
+        if sub not in grouped_dict:
+            grouped_dict[sub] = []
+
+        grouped_dict[sub].append({
             "id": item.id,
             "item_name": item.item_name,
             "tips": item.tips,
             "image_url": item.image_url if item.image_url else "/images/default_item.png"
+        })
+
+    # 2. 将字典转换为前端容易遍历的数组格式
+    result_list = []
+    for sub_cat, sub_items in grouped_dict.items():
+        result_list.append({
+            "subCategory": sub_cat,
+            "items": sub_items
         })
 
     return {
