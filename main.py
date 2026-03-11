@@ -2,12 +2,11 @@ import requests
 from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from fastapi import File, UploadFile, Form, Depends
-import shutil
 import os
 from sqlalchemy.sql.expression import func
-from typing import List
 from sqlalchemy import desc
-
+import random
+from datetime import datetime
 # 模型
 import io
 import torch
@@ -79,6 +78,32 @@ MODEL_IDX_TO_DB_ID = {
     2: 2, # 模型出 2 -> 对应数据库 2 (有害)
     3: 4  # 模型出 3 -> 对应数据库 4 (其他)
 }
+
+# 动态热度计算算法
+def calculate_dynamic_heat(created_at, real_click_count: int, article_id: int) -> int:
+    """
+    动态热度计算函数：基础随机值 + (存活天数 × 日均自然增长) + (真实点击量 × 权重)
+    """
+    if not created_at:
+        created_at = datetime.now()
+
+    # 1. 利用文章 ID 生成固定随机种子，保证同一篇文章的基础热度不会每次刷新都乱跳
+    random.seed(article_id)
+    base_heat = random.randint(500, 3000)  # 基础热度
+
+    # 2. 计算文章发布了多少天
+    days_alive = (datetime.now() - created_at).days
+    if days_alive < 0:
+        days_alive = 0
+
+    # 3. 时间发酵：每天自然增长 10~50 的热度
+    time_bonus = days_alive * random.randint(10, 50)
+
+    # 4. 真实点击的权重放大 (假设真实的 view_count 每次点击+1，我们放大3倍展示)
+    real_click_count = real_click_count if real_click_count else 0
+    total_heat = base_heat + time_bonus + (real_click_count * 3)
+
+    return total_heat
 
 @app.get("/")
 def read_root():
@@ -419,12 +444,15 @@ async def get_tips_carousel(db: Session = Depends(get_db)):
 
     result_list = []
     for tip in tips:
+        # 引入动态热度算法
+        dynamic_heat = calculate_dynamic_heat(tip.created_at, tip.view_count, tip.id)
+
         result_list.append({
             "id": tip.id,
             "title": tip.title,
             "content": tip.content,
             "image_url": tip.image_url,
-            "view_count": tip.view_count
+            "view_count": dynamic_heat  # 输出动态计算出的伪真实高热度
         })
 
     return {
@@ -450,13 +478,16 @@ async def get_tips_list(
 
     result_list = []
     for tip in tips:
+        # 引入动态热度算法
+        dynamic_heat = calculate_dynamic_heat(tip.created_at, tip.view_count, tip.id)
+
         result_list.append({
             "id": tip.id,
             "title": tip.title,
             "content": tip.content,
             "image_url": tip.image_url,
-            "view_count": tip.view_count,
-            "created_at": tip.created_at.strftime("%Y-%m-%d")
+            "view_count": dynamic_heat,  # 输出动态计算出的伪真实高热度
+            "created_at": tip.created_at.strftime("%Y-%m-%d") if tip.created_at else ""
         })
 
     return {
@@ -573,7 +604,7 @@ async def submit_feedback(feedback_data: schemas.FeedbackSubmitRequest, db: Sess
     }
 
 # ==============================================================================
-# 🌟 个人中心专属 API 组
+# 个人中心专属 API 组
 # ==============================================================================
 
 # 1. 获取个人中心首页概览数据
@@ -816,14 +847,7 @@ async def delete_feedback_history(item_id: int, db: Session = Depends(get_db)):
     return {"code": 200, "message": "删除成功"}
 
 
-import os
-import requests
-import uuid
-
-
-# ==========================================
 # 管理员接口：自动同步纠错反馈到训练集 (数据飞轮)
-# ==========================================
 @app.get("/api/admin/sync_feedback")
 async def sync_feedback_to_dataset(db: Session = Depends(get_db)):
     """
