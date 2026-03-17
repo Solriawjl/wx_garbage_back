@@ -199,13 +199,28 @@ async def recognize_garbage(
         return {"code": 500, "message": "AI 模型推理失败，请检查图像格式"}
 
     # ========================================
-    # 根据AI预测结果查询数据库并返回 (保持原有逻辑)
+    # 根据AI预测结果查询数据库并返回
     # ========================================
-    category_info = db.query(models.GarbageCategory).filter(models.GarbageCategory.id == predicted_category_id).first()
+    category_info = db.query(models.GarbageCategory).filter(
+        models.GarbageCategory.id == predicted_category_id).first()
 
     if not category_info:
         return {"code": 500, "message": "识别出错，未找到对应分类信息"}
 
+    # 从该大类下随机抽取 4 个具体物品
+    suggest_items = db.query(models.GarbageItem).filter(
+        models.GarbageItem.category_type == predicted_category_id
+    ).order_by(func.rand()).limit(10).all()
+
+    recommend_list = []
+    for item in suggest_items:
+        recommend_list.append({
+            "item_name": item.item_name,
+            "tips": item.tips,
+            "image_url": item.image_url if item.image_url else "/images/default_item.png"
+        })
+
+    # 存入历史记录
     new_history = models.RecognizeHistory(
         user_id=user_id,
         image_url=cos_image_url,
@@ -216,17 +231,28 @@ async def recognize_garbage(
     db.add(new_history)
     db.commit()
 
+    # 组装给前端的返回结果（加入教育闭环和推荐列表）
     mock_result = {
         "user_id": user_id,
         "image_path": cos_image_url,
-        "confidence": conf_val,  # 返回真实准确率
+        "confidence": conf_val,
         "category_id": category_info.id,
         "category_name": category_info.category_name,
         "category_class": category_info.category_class,
-        "eco_value": category_info.eco_value,
-        "put_guidance": category_info.put_guidance
-    }
 
+        # 原有基础字段
+        "eco_value": category_info.eco_value,
+        "put_guidance": category_info.put_guidance,
+
+        # 新增教育闭环与日式严谨标准字段
+        "harm_description": category_info.harm_description,
+        "process_method": category_info.process_method,
+        "sub_guidance": category_info.sub_guidance,
+
+        # 猜你想扔的具体物品列表
+        "recommend_items": recommend_list
+    }
+    # print("准备发给前端的数据：", mock_result)
     return {
         "code": 200,
         "message": "图片上传成功！AI识别完成",
@@ -253,14 +279,28 @@ async def recognize_garbage_edge(
     if not cos_image_url:
         return {"code": 500, "message": "图片上传云端失败，请稍后重试"}
 
-    # 2. 直接转换手机传来的 ID 并查数据库 (⚡️ 后端完全不吃显卡算力了！)
+    # 2. 直接转换手机传来的 ID 并查数据库
     predicted_category_id = MODEL_IDX_TO_DB_ID.get(predicted_idx, 4)
-    category_info = db.query(models.GarbageCategory).filter(models.GarbageCategory.id == predicted_category_id).first()
+    category_info = db.query(models.GarbageCategory).filter(
+        models.GarbageCategory.id == predicted_category_id).first()
 
     if not category_info:
         return {"code": 500, "message": "分类数据查询异常"}
 
-    # 3. 存入历史记录表，用于后续在小程序里展示，以及供数据飞轮重训
+    # “猜你想扔”
+    suggest_items = db.query(models.GarbageItem).filter(
+        models.GarbageItem.category_type == predicted_category_id
+    ).order_by(func.rand()).limit(10).all()
+
+    recommend_list = []
+    for item in suggest_items:
+        recommend_list.append({
+            "item_name": item.item_name,
+            "tips": item.tips,
+            "image_url": item.image_url if item.image_url else "/images/default_item.png"
+        })
+
+    # 3. 存入历史记录表
     new_history = models.RecognizeHistory(
         user_id=user_id,
         image_url=cos_image_url,
@@ -271,7 +311,7 @@ async def recognize_garbage_edge(
     db.add(new_history)
     db.commit()
 
-    # 4. 组装结果返回给前端展示
+    # 4. 组装结果返回给前端展示（加入教育闭环）
     mock_result = {
         "user_id": user_id,
         "image_path": cos_image_url,
@@ -279,10 +319,18 @@ async def recognize_garbage_edge(
         "category_id": category_info.id,
         "category_name": category_info.category_name,
         "category_class": category_info.category_class,
-        "eco_value": category_info.eco_value,
-        "put_guidance": category_info.put_guidance
-    }
 
+        # 教育闭环与科普字段
+        "eco_value": category_info.eco_value,
+        "put_guidance": category_info.put_guidance,
+        "harm_description": category_info.harm_description,
+        "process_method": category_info.process_method,
+        "sub_guidance": category_info.sub_guidance,
+
+        # 推荐物品列表
+        "recommend_items": recommend_list
+    }
+    # print("准备发给前端的数据：", mock_result)
     return {
         "code": 200,
         "message": "端云协同处理成功",
@@ -323,7 +371,12 @@ async def search_garbage(
         "eco_value": category_info.eco_value,
         "put_guidance": category_info.put_guidance,
         "tips": item.tips,
-        "image_url": item.image_url if item.image_url else "/images/null.png"
+        "image_url": item.image_url if item.image_url else "/images/null.png",
+
+        # 把教育闭环字段也加入到搜索结果中
+        "harm_description": category_info.harm_description,
+        "process_method": category_info.process_method,
+        "sub_guidance": category_info.sub_guidance
     }
 
     return {

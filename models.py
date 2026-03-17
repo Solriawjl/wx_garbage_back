@@ -119,6 +119,7 @@ class HomeConfig(Base):
     is_active = Column(Boolean, default=True, comment="是否启用")
     sort_order = Column(Integer, default=0, comment="排序权重")
 
+
 # --- 8. 四大垃圾分类详情表 ---
 class GarbageCategory(Base):
     __tablename__ = "garbage_categories"
@@ -126,8 +127,15 @@ class GarbageCategory(Base):
     id = Column(Integer, primary_key=True, index=True, comment="分类ID：1-可回收, 2-有害, 3-厨余, 4-其他")
     category_name = Column(String(20), nullable=False, comment="中文名称")
     category_class = Column(String(20), nullable=False, comment="前端CSS类名")
+
+    # --- 原有字段 ---
     eco_value = Column(Text, nullable=False, comment="环保价值")
-    put_guidance = Column(Text, nullable=False, comment="投放指导")
+    put_guidance = Column(Text, nullable=False, comment="通用一句话投放指导")
+
+    # --- 教育闭环与日式严谨标准字段 ---
+    harm_description = Column(Text, nullable=True, comment="如果不分类的危害（儿童科普语气）")
+    process_method = Column(Text, nullable=True, comment="回收/处理的生命周期（它最后变成了什么）")
+    sub_guidance = Column(Text, nullable=True, comment="各个官方小类的投放前置动作指导")
 
 # --- 9. 环保科普小知识表 ---
 class EnvironmentalTip(Base):
