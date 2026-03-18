@@ -143,3 +143,10 @@ class FeedbackSubmitRequest(BaseModel):
     image_url: Optional[str] = None # 照片链接，如果是文字搜索纠错则为空
     item_name: str             # 原来的错误结果 (比如AI说它是"可回收物")
     suggestion: str            # 用户选择的正确分类 (如果填了具体物品，就拼在后面)
+
+# ==========================================
+# 10. 后台管理系统 (Admin Web) 专用 Schema
+# ==========================================
+class AdminLoginRequest(BaseModel):
+    username: str = Field(..., description="管理员账号")
+    password: str = Field(..., description="管理员密码")

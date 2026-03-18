@@ -7,6 +7,8 @@ from sqlalchemy.sql.expression import func
 from sqlalchemy import desc
 import random
 from datetime import datetime
+from fastapi.middleware.cors import CORSMiddleware
+
 # 模型
 import io
 import torch
@@ -24,7 +26,23 @@ import uuid
 # 保险，不会重复建表
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="智能垃圾分类小程序 API", version="1.0")
+app = FastAPI(title="智能垃圾分类小程序 API", version="1.2")
+
+# ==========================================
+# 配置 CORS 跨域
+# ==========================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8848",
+        "http://127.0.0.1:8848",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],  # 允许所有请求方法 (GET, POST, PUT, DELETE)
+    allow_headers=["*"],  # 允许所有请求头
+)
 
 # ==========================================
 # 小程序凭证
@@ -104,6 +122,328 @@ def calculate_dynamic_heat(created_at, real_click_count: int, article_id: int) -
     total_heat = base_heat + time_bonus + (real_click_count * 3)
 
     return total_heat
+
+# ==============================================================================
+# 后台管理系统 (Admin Web) 专属 API 组
+# ==============================================================================
+
+@app.post("/api/admin/login")
+async def admin_login(login_data: schemas.AdminLoginRequest):
+    """
+    后台管理系统：管理员登录接口
+    """
+    # 极简验证：写死管理员账号密码
+    if login_data.username == "admin" and login_data.password == "123456":
+        # 必须返回 Vue 模板期待的数据格式，包含 access_token
+        return {
+            "code": 200,
+            "message": "登录成功",
+            "data": {
+                "access_token": f"fake-jwt-token-{uuid.uuid4().hex}" # 伪造一个随机 Token
+            }
+        }
+    else:
+        return {
+            "code": 500,  # 模板通常把非 200 视为错误
+            "message": "账号或密码错误，请重试！",
+            "data": None
+        }
+
+# ==============================================================================
+# 登录显示菜单
+# ==============================================================================
+@app.get("/api/admin/menu/list")
+async def get_geeker_menu():
+    """
+    后台管理系统：动态获取左侧菜单
+    """
+    return {
+        "code": 200,
+        "message": "成功",
+        "data": [
+            {
+                "path": "/home/index",
+                "name": "home",
+                "component": "/home/index",
+                "meta": {
+                    "icon": "HomeFilled",
+                    "title": "首页",
+                    "isLink": "",
+                    "isHide": False,
+                    "isFull": False,
+                    "isAffix": True,
+                    "isKeepAlive": True
+                }
+            },
+            {
+                "path": "/garbage",
+                "name": "garbage",
+                "redirect": "/garbage/items",
+                "meta": {
+                    "icon": "List",
+                    "title": "垃圾分类管理",
+                    "isLink": "",
+                    "isHide": False,
+                    "isFull": False,
+                    "isAffix": False,
+                    "isKeepAlive": True
+                },
+                "children": [
+                    {
+                        # 这里复用模板的 proTable 页面底子，稍后我们去改造它
+                        "path": "/proTable/useProTable",
+                        "name": "garbageItems",
+                        "component": "/proTable/useProTable/index",
+                        "meta": {
+                            "icon": "Menu",
+                            "title": "物品图鉴词库",
+                            "isLink": "",
+                            "isHide": False,
+                            "isFull": False,
+                            "isAffix": False,
+                            "isKeepAlive": True
+                        }
+                    },
+                    {
+                        "path": "/garbage/categories",
+                        "name": "garbageCategories",
+                        "component": "/proTable/useProTable/index", # 暂时指向同一个底子页面
+                        "meta": {
+                            "icon": "Collection",
+                            "title": "四大类科普配置", # 对应你的导师要求的日式严谨教育闭环
+                            "isLink": "",
+                            "isHide": False,
+                            "isFull": False,
+                            "isAffix": False,
+                            "isKeepAlive": True
+                        }
+                    }
+                ]
+            },
+            {
+                "path": "/feedback",
+                "name": "feedbackAudit",
+                "component": "/proTable/useProTable/index", # 暂时指向同一个底子页面
+                "meta": {
+                    "icon": "Comment",
+                    "title": "用户反馈审核", # 👉处理错题和建议
+                    "isLink": "",
+                    "isHide": False,
+                    "isFull": False,
+                    "isAffix": False,
+                    "isKeepAlive": True
+                }
+            },
+            {
+                "path": "/users",
+                "name": "userManage",
+                "component": "/proTable/useProTable/index", # 暂时指向同一个底子页面
+                "meta": {
+                    "icon": "User",
+                    "title": "小程序用户管理", # 用户信息
+                    "isLink": "",
+                    "isHide": False,
+                    "isFull": False,
+                    "isAffix": False,
+                    "isKeepAlive": True
+                }
+            }
+        ]
+    }
+
+@app.get("/api/admin/auth/buttons")
+async def get_geeker_buttons():
+    """
+    前端获取按钮权限的接口，直接返回空字典，防止报错即可
+    """
+    return {
+        "code": 200,
+        "message": "成功",
+        "data": {}
+    }
+
+# ==============================================================================
+# 后台管理系统 - 垃圾图鉴模块
+# ==============================================================================
+@app.get("/api/admin/items")
+async def get_admin_garbage_items(
+    pageNum: int = Query(1, description="当前页码"),
+    pageSize: int = Query(10, description="每页数量"),
+    item_name: str = Query(None, description="搜索：物品名称"),
+    category_type: int = Query(None, description="搜索：所属大类"),
+    db: Session = Depends(get_db)
+):
+    """
+    分页获取垃圾物品列表，支持条件筛选
+    """
+    # 1. 构建查询对象
+    query = db.query(models.GarbageItem)
+
+    # 2. 如果前端传了搜索条件，进行过滤
+    if item_name:
+        query = query.filter(models.GarbageItem.item_name.like(f"%{item_name}%"))
+    if category_type:
+        query = query.filter(models.GarbageItem.category_type == category_type)
+
+    # 3. 计算总数
+    total = query.count()
+
+    # 4. 分页查询
+    skip = (pageNum - 1) * pageSize
+    items = query.order_by(models.GarbageItem.id.desc()).offset(skip).limit(pageSize).all()
+
+    # 5. 格式化数据返回给 Vue 模板
+    list_data = []
+    for item in items:
+        list_data.append({
+            "id": item.id,
+            "item_name": item.item_name,
+            "category_type": item.category_type,
+            "sub_category": item.sub_category,
+            "tips": item.tips,
+            "image_url": item.image_url,
+            "created_at": item.created_at.strftime("%Y-%m-%d %H:%M:%S") if item.created_at else ""
+        })
+
+    # 必须严格符合 Geeker-Admin ProTable 的数据结构期望
+    return {
+        "code": 200,
+        "message": "成功",
+        "data": {
+            "list": list_data,
+            "total": total,
+            "pageNum": pageNum,
+            "pageSize": pageSize
+        }
+    }
+
+
+from pydantic import BaseModel
+from typing import List, Optional
+
+
+# --- Admin API 请求体数据模型 ---
+class AdminItemSchema(BaseModel):
+    item_name: str
+    category_type: int
+    sub_category: Optional[str] = "其他类"
+    tips: Optional[str] = ""
+    image_url: Optional[str] = ""
+
+
+class AdminDeleteSchema(BaseModel):
+    id: List[int]
+
+
+# ==========================================
+# 接口：后台新增垃圾物品
+# ==========================================
+@app.post("/api/admin/items")
+async def add_admin_garbage_item(item_data: AdminItemSchema, db: Session = Depends(get_db)):
+    new_item = models.GarbageItem(
+        item_name=item_data.item_name,
+        category_type=item_data.category_type,
+        sub_category=item_data.sub_category,
+        tips=item_data.tips,
+        image_url=item_data.image_url
+    )
+    db.add(new_item)
+    db.commit()
+    return {"code": 200, "message": "新增成功", "data": None}
+
+
+# ==========================================
+# 接口：后台修改垃圾物品
+# ==========================================
+@app.put("/api/admin/items/{item_id}")
+async def edit_admin_garbage_item(item_id: int, item_data: AdminItemSchema, db: Session = Depends(get_db)):
+    item = db.query(models.GarbageItem).filter(models.GarbageItem.id == item_id).first()
+    if not item:
+        return {"code": 404, "message": "物品不存在", "data": None}
+
+    item.item_name = item_data.item_name
+    item.category_type = item_data.category_type
+    item.sub_category = item_data.sub_category
+    item.tips = item_data.tips
+    item.image_url = item_data.image_url
+
+    db.commit()
+    return {"code": 200, "message": "修改成功", "data": None}
+
+
+# ==========================================
+# 接口：后台批量/单条删除垃圾物品
+# ==========================================
+@app.post("/api/admin/items/delete")
+async def delete_admin_garbage_items(req: AdminDeleteSchema, db: Session = Depends(get_db)):
+    db.query(models.GarbageItem).filter(models.GarbageItem.id.in_(req.id)).delete(synchronize_session=False)
+    db.commit()
+    return {"code": 200, "message": "删除成功", "data": None}
+
+# 管理员接口：自动同步纠错反馈到训练集 (数据飞轮)
+@app.get("/api/admin/sync_feedback")
+async def sync_feedback_to_dataset(db: Session = Depends(get_db)):
+    """
+    扫描所有状态为“待处理”的图片纠错反馈，
+    将错题图片自动下载并归类到本地的 train 文件夹中。
+    """
+    # 查找所有待处理的图片反馈
+    feedbacks = db.query(models.Feedback).filter(
+        models.Feedback.type == 'image',
+        models.Feedback.status == 0
+    ).all()
+
+    if not feedbacks:
+        return {"code": 200, "message": "暂无需要同步的新反馈数据"}
+
+    # 映射表：将中文分类映射到你的训练集文件夹名
+    category_to_folder = {
+        "厨余垃圾": "0",
+        "可回收物": "1",
+        "有害垃圾": "2",
+        "其他垃圾": "3"
+    }
+
+    base_train_dir = "./train"
+    os.makedirs(base_train_dir, exist_ok=True)
+
+    saved_count = 0
+
+    for fb in feedbacks:
+        # 模糊匹配分类名 (解决 "有害垃圾 (实际物品：药膏)" 匹配失败的问题)
+        target_folder = None
+        if fb.suggestion:
+            for key, val in category_to_folder.items():
+                if key in fb.suggestion:
+                    target_folder = val
+                    break
+
+        # 防御性编程，如果不是 http 开头的公网链接，直接跳过，防止程序崩溃
+        if not target_folder or not fb.image_url or not fb.image_url.startswith("http"):
+            print(f"跳过无效记录 ID:{fb.id} -> 目录:{target_folder}, URL:{fb.image_url}")
+            continue
+
+        target_dir = os.path.join(base_train_dir, target_folder)
+        os.makedirs(target_dir, exist_ok=True)
+
+        try:
+            # 下载错题图片
+            img_data = requests.get(fb.image_url).content
+            file_name = f"feedback_{fb.id}_{uuid.uuid4().hex[:8]}.jpg"
+            file_path = os.path.join(target_dir, file_name)
+
+            with open(file_path, "wb") as f:
+                f.write(img_data)
+
+            # 更新反馈状态为 1 (已采纳)
+            fb.status = 1
+            saved_count += 1
+        except Exception as e:
+            print(f"下载图片失败 {fb.image_url}: {e}")
+
+    db.commit()
+    return {"code": 200, "message": f"飞轮运转！成功将 {saved_count} 张错题照片同步到了训练集。"}
+
 
 @app.get("/")
 def read_root():
@@ -899,67 +1239,81 @@ async def delete_feedback_history(item_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"code": 200, "message": "删除成功"}
 
+# 排行榜接口
+@app.get("/api/leaderboard")
+def get_leaderboard(db: Session = Depends(get_db)):
+    # 查询积分最高的前 10 名用户，按 total_score 降序排列
+    top_users = db.query(models.User).order_by(models.User.total_score.desc()).limit(10).all()
 
-# 管理员接口：自动同步纠错反馈到训练集 (数据飞轮)
-@app.get("/api/admin/sync_feedback")
-async def sync_feedback_to_dataset(db: Session = Depends(get_db)):
-    """
-    扫描所有状态为“待处理”的图片纠错反馈，
-    将错题图片自动下载并归类到本地的 train 文件夹中。
-    """
-    # 查找所有待处理的图片反馈
-    feedbacks = db.query(models.Feedback).filter(
-        models.Feedback.type == 'image',
-        models.Feedback.status == 0
-    ).all()
+    result = []
+    for index, user in enumerate(top_users):
+        # 组装返回数据，如果没有昵称和头像，就给个默认的兜底
+        nickname = getattr(user, 'nickname', None)
+        avatar = getattr(user, 'avatar_url', None)
 
-    if not feedbacks:
-        return {"code": 200, "message": "暂无需要同步的新反馈数据"}
+        result.append({
+            "rank": index + 1,
+            "user_id": user.id,
+            "nickname": nickname if nickname else f"环保卫士_{user.id}",
+            "avatar_url": avatar if avatar else "https://images-1408449839.cos.ap-chengdu.myqcloud.com/images/user/head.png",
+            "total_score": user.total_score,
+            "title": getattr(user, 'title', '环保新手')
+        })
 
-    # 映射表：将中文分类映射到你的训练集文件夹名
-    category_to_folder = {
-        "厨余垃圾": "0",
-        "可回收物": "1",
-        "有害垃圾": "2",
-        "其他垃圾": "3"
+    return {
+        "code": 200,
+        "message": "获取成功",
+        "data": result
     }
 
-    base_train_dir = "./train"
-    os.makedirs(base_train_dir, exist_ok=True)
+from pydantic import BaseModel
+# --- 接收昵称的数据模型 ---
+class NicknameUpdate(BaseModel):
+    user_id: int
+    nickname: str
 
-    saved_count = 0
 
-    for fb in feedbacks:
-        # 模糊匹配分类名 (解决 "有害垃圾 (实际物品：药膏)" 匹配失败的问题)
-        target_folder = None
-        if fb.suggestion:
-            for key, val in category_to_folder.items():
-                if key in fb.suggestion:
-                    target_folder = val
-                    break
+# 1. 更新用户昵称的接口
+@app.post("/api/user/update_nickname")
+def update_nickname(request: NicknameUpdate, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == request.user_id).first()
+    if not user:
+        return {"code": 404, "message": "用户不存在"}
 
-        # 防御性编程，如果不是 http 开头的公网链接，直接跳过，防止程序崩溃
-        if not target_folder or not fb.image_url or not fb.image_url.startswith("http"):
-            print(f"跳过无效记录 ID:{fb.id} -> 目录:{target_folder}, URL:{fb.image_url}")
-            continue
-
-        target_dir = os.path.join(base_train_dir, target_folder)
-        os.makedirs(target_dir, exist_ok=True)
-
-        try:
-            # 下载错题图片
-            img_data = requests.get(fb.image_url).content
-            file_name = f"feedback_{fb.id}_{uuid.uuid4().hex[:8]}.jpg"
-            file_path = os.path.join(target_dir, file_name)
-
-            with open(file_path, "wb") as f:
-                f.write(img_data)
-
-            # 更新反馈状态为 1 (已采纳)
-            fb.status = 1
-            saved_count += 1
-        except Exception as e:
-            print(f"下载图片失败 {fb.image_url}: {e}")
-
+    user.nickname = request.nickname
     db.commit()
-    return {"code": 200, "message": f"飞轮运转！成功将 {saved_count} 张错题照片同步到了训练集。"}
+    return {"code": 200, "message": "昵称更新成功"}
+
+
+# 2. 更新用户头像的接口 (接收图片文件 -> 上传COS -> 存入数据库)
+@app.post("/api/user/update_avatar")
+def update_avatar(user_id: int = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        return {"code": 404, "message": "用户不存在"}
+
+    # 读取图片文件字节
+    file_bytes = file.file.read()
+
+    # 提取后缀名并生成一个云端唯一文件名 (存放在 avatars 文件夹下)
+    ext = os.path.splitext(file.filename)[1]
+    if not ext:
+        ext = ".jpg"  # 兜底后缀
+    cloud_file_name = f"avatars/{uuid.uuid4().hex}{ext}"
+
+    # 调用你已经写好的 COS 上传函数
+    cos_url = upload_file_to_cos(file_bytes, cloud_file_name)
+
+    if not cos_url:
+        return {"code": 500, "message": "头像上传云端失败"}
+
+    # 将腾讯云返回的公网链接存入数据库
+    user.avatar_url = cos_url
+    db.commit()
+
+    return {
+        "code": 200,
+        "message": "头像更新成功",
+        "data": {"avatar_url": cos_url}
+    }
+
