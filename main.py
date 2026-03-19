@@ -191,9 +191,9 @@ async def get_geeker_menu():
                 "children": [
                     {
                         # 这里复用模板的 proTable 页面底子，稍后我们去改造它
-                        "path": "/proTable/useProTable",
+                        "path": "/garbage/items",
                         "name": "garbageItems",
-                        "component": "/proTable/useProTable/index",
+                        "component": "/garbage/items/index",
                         "meta": {
                             "icon": "Menu",
                             "title": "物品图鉴词库",
@@ -207,7 +207,7 @@ async def get_geeker_menu():
                     {
                         "path": "/garbage/categories",
                         "name": "garbageCategories",
-                        "component": "/proTable/useProTable/index", # 暂时指向同一个底子页面
+                        "component": "/garbage/categories/index", # 暂时指向同一个底子页面
                         "meta": {
                             "icon": "Collection",
                             "title": "四大类科普配置", # 对应你的导师要求的日式严谨教育闭环
@@ -223,10 +223,10 @@ async def get_geeker_menu():
             {
                 "path": "/feedback",
                 "name": "feedbackAudit",
-                "component": "/proTable/useProTable/index", # 暂时指向同一个底子页面
+                "component": "/feedback/index",
                 "meta": {
                     "icon": "Comment",
-                    "title": "用户反馈审核", # 👉处理错题和建议
+                    "title": "用户反馈审核", # 理错题和建议
                     "isLink": "",
                     "isHide": False,
                     "isFull": False,
@@ -237,7 +237,7 @@ async def get_geeker_menu():
             {
                 "path": "/users",
                 "name": "userManage",
-                "component": "/proTable/useProTable/index", # 暂时指向同一个底子页面
+                "component": "/users/index",
                 "meta": {
                     "icon": "User",
                     "title": "小程序用户管理", # 用户信息
@@ -380,70 +380,315 @@ async def delete_admin_garbage_items(req: AdminDeleteSchema, db: Session = Depen
     db.commit()
     return {"code": 200, "message": "删除成功", "data": None}
 
-# 管理员接口：自动同步纠错反馈到训练集 (数据飞轮)
-@app.get("/api/admin/sync_feedback")
-async def sync_feedback_to_dataset(db: Session = Depends(get_db)):
-    """
-    扫描所有状态为“待处理”的图片纠错反馈，
-    将错题图片自动下载并归类到本地的 train 文件夹中。
-    """
-    # 查找所有待处理的图片反馈
-    feedbacks = db.query(models.Feedback).filter(
-        models.Feedback.type == 'image',
-        models.Feedback.status == 0
-    ).all()
 
-    if not feedbacks:
-        return {"code": 200, "message": "暂无需要同步的新反馈数据"}
+# ==============================================================================
+# 后台管理系统 - 四大类科普配置模块 (固定4条数据，仅支持修改)
+# ==============================================================================
+class AdminCategorySchema(BaseModel):
+    eco_value: Optional[str] = ""
+    put_guidance: Optional[str] = ""
+    harm_description: Optional[str] = ""
+    process_method: Optional[str] = ""
+    sub_guidance: Optional[str] = ""
 
-    # 映射表：将中文分类映射到你的训练集文件夹名
-    category_to_folder = {
-        "厨余垃圾": "0",
-        "可回收物": "1",
-        "有害垃圾": "2",
-        "其他垃圾": "3"
+@app.get("/api/admin/categories")
+async def get_admin_categories(db: Session = Depends(get_db)):
+    """
+    获取四大分类的科普配置列表
+    """
+    categories = db.query(models.GarbageCategory).order_by(models.GarbageCategory.id.asc()).all()
+
+    list_data = []
+    for cat in categories:
+        list_data.append({
+            "id": cat.id,
+            "category_name": cat.category_name,
+            "category_class": cat.category_class,
+            "eco_value": cat.eco_value,
+            "put_guidance": cat.put_guidance,
+            "harm_description": cat.harm_description,
+            "process_method": cat.process_method,
+            "sub_guidance": cat.sub_guidance
+        })
+
+    return {
+        "code": 200,
+        "message": "成功",
+        "data": list_data  # 直接返回数组，去掉之前的字典嵌套
     }
 
-    base_train_dir = "./train"
-    os.makedirs(base_train_dir, exist_ok=True)
 
-    saved_count = 0
+@app.put("/api/admin/categories/{category_id}")
+async def edit_admin_category(category_id: int, req_data: AdminCategorySchema, db: Session = Depends(get_db)):
+    """
+    修改特定大类的科普说明
+    """
+    cat = db.query(models.GarbageCategory).filter(models.GarbageCategory.id == category_id).first()
+    if not cat:
+        return {"code": 404, "message": "分类不存在"}
 
-    for fb in feedbacks:
-        # 模糊匹配分类名 (解决 "有害垃圾 (实际物品：药膏)" 匹配失败的问题)
-        target_folder = None
-        if fb.suggestion:
-            for key, val in category_to_folder.items():
-                if key in fb.suggestion:
-                    target_folder = val
-                    break
-
-        # 防御性编程，如果不是 http 开头的公网链接，直接跳过，防止程序崩溃
-        if not target_folder or not fb.image_url or not fb.image_url.startswith("http"):
-            print(f"跳过无效记录 ID:{fb.id} -> 目录:{target_folder}, URL:{fb.image_url}")
-            continue
-
-        target_dir = os.path.join(base_train_dir, target_folder)
-        os.makedirs(target_dir, exist_ok=True)
-
-        try:
-            # 下载错题图片
-            img_data = requests.get(fb.image_url).content
-            file_name = f"feedback_{fb.id}_{uuid.uuid4().hex[:8]}.jpg"
-            file_path = os.path.join(target_dir, file_name)
-
-            with open(file_path, "wb") as f:
-                f.write(img_data)
-
-            # 更新反馈状态为 1 (已采纳)
-            fb.status = 1
-            saved_count += 1
-        except Exception as e:
-            print(f"下载图片失败 {fb.image_url}: {e}")
+    cat.eco_value = req_data.eco_value
+    cat.put_guidance = req_data.put_guidance
+    cat.harm_description = req_data.harm_description
+    cat.process_method = req_data.process_method
+    cat.sub_guidance = req_data.sub_guidance
 
     db.commit()
-    return {"code": 200, "message": f"飞轮运转！成功将 {saved_count} 张错题照片同步到了训练集。"}
+    return {"code": 200, "message": "科普配置更新成功", "data": None}
 
+class AuditFeedbackSchema(BaseModel):
+    id: int
+    status: int  # 1-采纳, 2-驳回
+    admin_reply: Optional[str] = ""  # 管理员回复字段
+
+
+# ==========================================
+# 接口：后台获取用户反馈列表
+# ==========================================
+@app.get("/api/admin/feedbacks")
+async def get_admin_feedbacks(
+        pageNum: int = Query(1),
+        pageSize: int = Query(10),
+        status: int = Query(None),
+        item_name: str = Query(None),
+        db: Session = Depends(get_db)
+):
+    query = db.query(models.Feedback)
+
+    if status is not None:
+        query = query.filter(models.Feedback.status == status)
+    if item_name:
+        query = query.filter(models.Feedback.item_name.like(f"%{item_name}%"))
+
+    total = query.count()
+    skip = (pageNum - 1) * pageSize
+    feedbacks = query.order_by(models.Feedback.created_at.desc()).offset(skip).limit(pageSize).all()
+
+    list_data = []
+    for f in feedbacks:
+        list_data.append({
+            "id": f.id,
+            "user_id": f.user_id,
+            "type": f.type.value if hasattr(f.type, 'value') else f.type,
+            "image_url": f.image_url,
+            "item_name": f.item_name,
+            "suggestion": f.suggestion,
+            "status": f.status,
+            "admin_reply": f.admin_reply if hasattr(f, 'admin_reply') else "",
+            "created_at": f.created_at.strftime("%Y-%m-%d %H:%M:%S") if f.created_at else ""
+        })
+
+    return {
+        "code": 200, "message": "成功",
+        "data": {"list": list_data, "total": total, "pageNum": pageNum, "pageSize": pageSize}
+    }
+
+
+# ==========================================
+# 接口：后台审核反馈 (采纳/驳回)
+# ==========================================
+@app.post("/api/admin/feedbacks/audit")
+async def audit_admin_feedback(req: AuditFeedbackSchema, db: Session = Depends(get_db)):
+    feedback = db.query(models.Feedback).filter(models.Feedback.id == req.id).first()
+    if not feedback:
+        return {"code": 404, "message": "反馈记录不存在"}
+
+    feedback.status = req.status
+    feedback.admin_reply = req.admin_reply
+
+    # 【核心逻辑：真实采纳入库】
+    # 如果状态是 1(采纳)，且有图片URL，且是图片类型的反馈
+    if req.status == 1 and feedback.image_url and feedback.type in ["image", "图片"]:
+        try:
+            # 1. 数据清洗：提取纯净的四大类名称
+            raw_suggestion = feedback.suggestion if feedback.suggestion else ""
+            correct_category = "未分类"
+            # 无论后缀带了什么，只要包含了这四个关键字，就精准归类
+            for standard_cat in ["可回收物", "有害垃圾", "厨余垃圾", "其他垃圾"]:
+                if standard_cat in raw_suggestion:
+                    correct_category = standard_cat
+                    break
+
+            # 2. 确定保存目录 (现在它只会生成四大类标准文件夹了)
+            save_dir = os.path.join("E:/wechat/feedback_image", "train", correct_category)
+            os.makedirs(save_dir, exist_ok=True)
+
+            # 3. 下载图片
+            response = requests.get(feedback.image_url, timeout=10)
+            if response.status_code == 200:
+                # 生成唯一文件名
+                file_name = f"feedback_{uuid.uuid4().hex[:8]}.jpg"
+                file_path = os.path.join(save_dir, file_name)
+
+                # 4. 写入文件
+                with open(file_path, "wb") as f:
+                    f.write(response.content)
+                print(f"✅ 飞轮运转：已成功将纠错照片采纳入训练集 -> {file_path}")
+            else:
+                print(f"⚠️ 图片下载失败，HTTP状态码: {response.status_code}")
+
+        except Exception as e:
+            print(f"❌ 采纳图片处理时发生异常: {e}")
+
+    db.commit()
+    return {"code": 200, "message": "审核完成，数据已入库", "data": None}
+
+# ==============================================================================
+# 后台管理系统 - 小程序用户管理模块
+# ==============================================================================
+
+@app.get("/api/admin/users")
+async def get_admin_users(
+    pageNum: int = Query(1, description="当前页码"),
+    pageSize: int = Query(10, description="每页数量"),
+    nickname: str = Query(None, description="搜索：用户昵称"),
+    db: Session = Depends(get_db)
+):
+    """
+    分页获取小程序注册用户列表
+    """
+    query = db.query(models.User)
+
+    # 支持按昵称模糊搜索
+    if nickname:
+        query = query.filter(models.User.nickname.like(f"%{nickname}%"))
+
+    total = query.count()
+    skip = (pageNum - 1) * pageSize
+    users = query.order_by(models.User.id.desc()).offset(skip).limit(pageSize).all()
+
+    list_data = []
+    for u in users:
+        list_data.append({
+            "id": u.id,
+            "openid": u.openid,  # 微信唯一标识
+            "nickname": u.nickname or "微信用户",
+            "avatar_url": u.avatar_url or "",
+            "score": u.total_score ,  # 积分段位
+            "title": u.title if hasattr(u, 'title') and u.title else "环保新手",
+            "created_at": u.created_at.strftime("%Y-%m-%d %H:%M:%S") if u.created_at else ""
+        })
+
+    return {
+        "code": 200,
+        "message": "成功",
+        "data": {
+            "list": list_data,
+            "total": total,
+            "pageNum": pageNum,
+            "pageSize": pageSize
+        }
+    }
+
+class AdminUserSchema(BaseModel):
+    nickname: str
+    score: int = 0
+    title: Optional[str] = "环保新手"
+    avatar_url: Optional[str] = ""  # 接收前端传来的头像URL
+
+class AdminDeleteSchema(BaseModel):
+    id: List[int]
+
+@app.post("/api/admin/users")
+async def add_admin_user(user_data: AdminUserSchema, db: Session = Depends(get_db)):
+    """后台手动新增用户 (主要用于测试或发放虚拟账号)"""
+    new_user = models.User(
+        openid=f"admin_add_{uuid.uuid4().hex[:8]}",
+        nickname=user_data.nickname,
+        total_score=user_data.score,
+        title=user_data.title,
+        avatar_url=user_data.avatar_url # 存入前端传来的头像
+    )
+    db.add(new_user)
+    db.commit()
+    return {"code": 200, "message": "新增用户成功", "data": None}
+
+@app.post("/api/admin/users/delete")
+async def delete_admin_users(req: AdminDeleteSchema, db: Session = Depends(get_db)):
+    """后台删除用户"""
+    db.query(models.User).filter(models.User.id.in_(req.id)).delete(synchronize_session=False)
+    db.commit()
+    return {"code": 200, "message": "删除成功", "data": None}
+
+# web通知
+@app.get("/api/admin/notifications")
+async def get_notifications(db: Session = Depends(get_db)):
+    """获取后台全局通知/待办数量"""
+    # 统计状态为 0 (待处理) 的反馈数量
+    pending_feedback_count = db.query(models.Feedback).filter(models.Feedback.status == 0).count()
+
+    return {
+        "code": 200,
+        "message": "成功",
+        "data": {
+            "pending_feedbacks": pending_feedback_count
+        }
+    }
+
+
+# ==============================================================================
+# 后台管理系统 - 首页大盘 (Dashboard) 数据统计
+# ==============================================================================
+from datetime import datetime, timedelta
+from sqlalchemy import func
+@app.get("/api/admin/dashboard/stats")
+async def get_dashboard_stats(db: Session = Depends(get_db)):
+    """获取首页大盘统计数据 (完全采用真实数据库数据)"""
+
+    # 1. 基础数据统计
+    user_count = db.query(models.User).count()
+    item_count = db.query(models.GarbageItem).count()
+    pending_feedback = db.query(models.Feedback).filter(models.Feedback.status == 0).count()
+
+    # 真实的累计识别总次数
+    recognize_count = db.query(models.RecognizeHistory).count()
+
+    # ==========================================
+    # 2. 真实的近 7 天趋势图数据计算
+    # ==========================================
+    today = datetime.now().date()
+    seven_days_ago = today - timedelta(days=6)  # 包含今天在内的过去7天
+
+    # 使用 SQLAlchemy 的 func.date 提取日期，并进行分组统计 (Group By)
+    daily_counts = db.query(
+        func.date(models.RecognizeHistory.created_at).label("date"),
+        func.count(models.RecognizeHistory.id).label("count")
+    ).filter(
+        func.date(models.RecognizeHistory.created_at) >= seven_days_ago
+    ).group_by(
+        func.date(models.RecognizeHistory.created_at)
+    ).all()
+
+    # 将查询结果转为字典方便查找: { datetime.date(2026, 3, 11): 2, ... }
+    count_dict = {row.date: row.count for row in daily_counts}
+
+    # 构建完整的7天X轴和Y轴数据 (关键逻辑：填补那些识别次数为0的日期)
+    x_axis = []
+    series = []
+
+    for i in range(7):
+        current_date = seven_days_ago + timedelta(days=i)
+        # 格式化 X 轴显示为 "MM-DD"，例如 "03-11"
+        x_axis.append(current_date.strftime("%m-%d"))
+        # 从字典中取当天的数据，如果没有就给 0
+        series.append(count_dict.get(current_date, 0))
+
+    chart_data = {
+        "xAxis": x_axis,
+        "series": series
+    }
+
+    return {
+        "code": 200,
+        "message": "成功",
+        "data": {
+            "user_count": user_count,
+            "item_count": item_count,
+            "pending_feedback": pending_feedback,
+            "recognize_count": recognize_count,
+            "chart_data": chart_data
+        }
+    }
 
 @app.get("/")
 def read_root():
