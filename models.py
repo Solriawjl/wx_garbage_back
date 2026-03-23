@@ -58,6 +58,7 @@ class RecognizeHistory(Base):
     category_type = Column(Integer, nullable=False, comment="分类类型")
     confidence = Column(Numeric(5, 2), nullable=True, comment="置信度")
     created_at = Column(DateTime, server_default=func.now(), comment="识别时间")
+    is_deleted = Column(Boolean, default=False, comment="逻辑删除状态: False-可见, True-用户已删除")
 
     # 反向关联
     user = relationship("User", back_populates="recognize_histories")
@@ -73,6 +74,7 @@ class ChallengeHistory(Base):
     correct_count = Column(Integer, nullable=False, comment="答对题数")
     earned_title = Column(String(50), nullable=False, comment="获得称号")
     created_at = Column(DateTime, server_default=func.now(), comment="答题时间")
+    is_deleted = Column(Boolean, default=False, comment="逻辑删除状态: False-可见, True-用户已删除")
 
     user = relationship("User", back_populates="challenge_histories")
 
@@ -87,6 +89,7 @@ class WrongBook(Base):
     user_answer = Column(String(50), nullable=False, comment="用户的错误选项")
     correct_answer = Column(String(50), nullable=False, comment="正确答案")
     created_at = Column(DateTime, server_default=func.now(), comment="做错时间")
+    is_deleted = Column(Boolean, default=False, comment="逻辑删除状态: False-可见, True-用户已删除")
 
     user = relationship("User", back_populates="wrong_books")
 
@@ -105,6 +108,7 @@ class Feedback(Base):
     admin_reply = Column(Text, nullable=True, comment="管理员回复")
     created_at = Column(DateTime, server_default=func.now(), comment="提交时间")
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), comment="处理时间")
+    is_deleted = Column(Boolean, default=False, comment="逻辑删除状态: False-可见, True-用户已删除")
 
     user = relationship("User", back_populates="feedbacks")
 
@@ -148,3 +152,13 @@ class EnvironmentalTip(Base):
     view_count = Column(Integer, default=0, comment="阅读量")
     created_at = Column(DateTime, server_default=func.now(), comment="发布时间")
 
+# --- 10. 低置信度难例收集表 (Auto-collected Hard Examples) ---
+class LowConfidenceRecord(Base):
+    __tablename__ = "low_confidence_records"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    image_url = Column(String(255), nullable=False, comment="COS原始图片链接")
+    ai_predicted_category = Column(Integer, nullable=False, comment="当时AI预测的大类ID")
+    confidence = Column(Numeric(5, 2), nullable=False, comment="当时的低置信度")
+    status = Column(Integer, default=0, comment="0-待标注, 1-已打标入库, 2-废弃(如图片模糊)")
+    created_at = Column(DateTime, server_default=func.now(), comment="收集时间")

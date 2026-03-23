@@ -153,7 +153,7 @@ async def admin_login(login_data: schemas.AdminLoginRequest):
 # 登录显示菜单
 # ==============================================================================
 @app.get("/api/admin/menu/list")
-async def get_geeker_menu():
+async def get_admin_menu():
     """
     后台管理系统：动态获取左侧菜单
     """
@@ -235,6 +235,20 @@ async def get_geeker_menu():
                 }
             },
             {
+                "path": "/low_confidence",
+                "name": "lowConfidenceAudit",
+                "component": "/low_confidence/index",  # 前端在 views/low_confidence/index.vue 开发页面
+                "meta": {
+                    "icon": "Aim",  # 使用一个瞄准或拦截的图标
+                    "title": "疑难图片复核",
+                    "isLink": "",
+                    "isHide": False,
+                    "isFull": False,
+                    "isAffix": False,
+                    "isKeepAlive": True
+                }
+            },
+            {
                 "path": "/users",
                 "name": "userManage",
                 "component": "/users/index",
@@ -252,7 +266,7 @@ async def get_geeker_menu():
     }
 
 @app.get("/api/admin/auth/buttons")
-async def get_geeker_buttons():
+async def get_admin_buttons():
     """
     前端获取按钮权限的接口，直接返回空字典，防止报错即可
     """
@@ -626,6 +640,64 @@ async def get_notifications(db: Session = Depends(get_db)):
     }
 
 
+# --- 数据校验 Schema ---
+class AuditLowConfidenceSchema(BaseModel):
+    id: int
+    status: int  # 1-打标入库, 2-废弃(比如用户拍了张纯黑的废图)
+    correct_category_name: Optional[str] = None  # 如果入库，管理员选择的真实四大类名称
+
+
+# --- 接口：获取低置信度拦截列表 ---
+@app.get("/api/admin/low_confidence")
+async def get_low_confidence_list(
+        pageNum: int = Query(1),
+        pageSize: int = Query(10),
+        status: int = Query(None),
+        db: Session = Depends(get_db)
+):
+    query = db.query(models.LowConfidenceRecord)
+    if status is not None:
+        query = query.filter(models.LowConfidenceRecord.status == status)
+
+    total = query.count()
+    skip = (pageNum - 1) * pageSize
+    records = query.order_by(models.LowConfidenceRecord.created_at.desc()).offset(skip).limit(pageSize).all()
+
+    list_data = [{"id": r.id, "image_url": r.image_url, "confidence": r.confidence, "status": r.status} for r in
+                 records]
+
+    return {"code": 200, "data": {"list": list_data, "total": total, "pageNum": pageNum, "pageSize": pageSize}}
+
+
+# --- 接口：打标并让数据飞轮运转 ---
+@app.post("/api/admin/low_confidence/audit")
+async def audit_low_confidence(req: AuditLowConfidenceSchema, db: Session = Depends(get_db)):
+    record = db.query(models.LowConfidenceRecord).filter(models.LowConfidenceRecord.id == req.id).first()
+    if not record:
+        return {"code": 404, "message": "记录不存在"}
+
+    record.status = req.status
+
+    # 【核心逻辑：真实打标入库训练集】
+    if req.status == 1 and req.correct_category_name:
+        try:
+            # 存入你之前写好的训练集目录
+            save_dir = os.path.join("E:/wechat/feedback_image", "train", req.correct_category_name)
+            os.makedirs(save_dir, exist_ok=True)
+
+            response = requests.get(record.image_url, timeout=10)
+            if response.status_code == 200:
+                file_name = f"hard_example_{uuid.uuid4().hex[:8]}.jpg"
+                file_path = os.path.join(save_dir, file_name)
+                with open(file_path, "wb") as f:
+                    f.write(response.content)
+                print(f"难例飞轮运转：已将低置信度照片打标入库 -> {file_path}")
+        except Exception as e:
+            print(f"下载难例图片失败: {e}")
+
+    db.commit()
+    return {"code": 200, "message": "处理完成"}
+
 # ==============================================================================
 # 后台管理系统 - 首页大盘 (Dashboard) 数据统计
 # ==============================================================================
@@ -805,6 +877,16 @@ async def recognize_garbage(
             "image_url": item.image_url if item.image_url else "/images/default_item.png"
         })
 
+    # 低置信度难例自动拦截入库逻辑
+    CONFIDENCE_THRESHOLD = 70.0  # 设置阈值
+    if confidence < CONFIDENCE_THRESHOLD:
+        new_hard_example = models.LowConfidenceRecord(
+            image_url=cos_image_url,
+            ai_predicted_category=category_info.id,
+            confidence=confidence
+        )
+        db.add(new_hard_example)
+
     # 存入历史记录
     new_history = models.RecognizeHistory(
         user_id=user_id,
@@ -884,6 +966,15 @@ async def recognize_garbage_edge(
             "tips": item.tips,
             "image_url": item.image_url if item.image_url else "/images/default_item.png"
         })
+    # 低置信度难例自动拦截入库逻辑
+    CONFIDENCE_THRESHOLD = 70.0  # 设置阈值
+    if confidence < CONFIDENCE_THRESHOLD:
+        new_hard_example = models.LowConfidenceRecord(
+            image_url=cos_image_url,
+            ai_predicted_category=category_info.id,
+            confidence=confidence
+        )
+        db.add(new_hard_example)
 
     # 3. 存入历史记录表
     new_history = models.RecognizeHistory(
@@ -1270,7 +1361,8 @@ async def get_user_info(user_id: int, db: Session = Depends(get_db)):
 @app.get("/api/user/recognize_history")
 async def get_recognize_history(user_id: int, db: Session = Depends(get_db)):
     histories = db.query(models.RecognizeHistory).filter(
-        models.RecognizeHistory.user_id == user_id
+        models.RecognizeHistory.user_id == user_id,
+        models.RecognizeHistory.is_deleted == False
     ).order_by(desc(models.RecognizeHistory.created_at)).all()
 
     result = []
@@ -1292,7 +1384,8 @@ async def get_recognize_history(user_id: int, db: Session = Depends(get_db)):
 @app.get("/api/user/challenge_history")
 async def get_challenge_history(user_id: int, db: Session = Depends(get_db)):
     histories = db.query(models.ChallengeHistory).filter(
-        models.ChallengeHistory.user_id == user_id
+        models.ChallengeHistory.user_id == user_id,
+        models.RecognizeHistory.is_deleted == False
     ).order_by(desc(models.ChallengeHistory.created_at)).all()
 
     result = []
@@ -1321,7 +1414,8 @@ async def get_challenge_history(user_id: int, db: Session = Depends(get_db)):
 @app.get("/api/user/wrong_book")
 async def get_wrong_book(user_id: int, db: Session = Depends(get_db)):
     wrongs = db.query(models.WrongBook).filter(
-        models.WrongBook.user_id == user_id
+        models.WrongBook.user_id == user_id,
+        models.RecognizeHistory.is_deleted == False
     ).order_by(desc(models.WrongBook.created_at)).all()
 
     result = []
@@ -1339,7 +1433,8 @@ async def get_wrong_book(user_id: int, db: Session = Depends(get_db)):
 @app.get("/api/user/feedback_history")
 async def get_feedback_history(user_id: int, db: Session = Depends(get_db)):
     feedbacks = db.query(models.Feedback).filter(
-        models.Feedback.user_id == user_id
+        models.Feedback.user_id == user_id,
+        models.RecognizeHistory.is_deleted == False
     ).order_by(desc(models.Feedback.created_at)).all()
 
     result = []
@@ -1365,61 +1460,55 @@ async def get_feedback_history(user_id: int, db: Session = Depends(get_db)):
 # --- 错题本 删除接口 ---
 @app.delete("/api/user/wrong_book/clear")
 async def clear_wrong_book(user_id: int, db: Session = Depends(get_db)):
-    db.query(models.WrongBook).filter(models.WrongBook.user_id == user_id).delete()
+    db.query(models.WrongBook).filter(
+        models.WrongBook.user_id == user_id,
+        models.WrongBook.is_deleted == False
+    ).update({"is_deleted": True})
     db.commit()
     return {"code": 200, "message": "清空成功"}
+
 
 @app.delete("/api/user/wrong_book/{item_id}")
 async def delete_wrong_item(item_id: int, db: Session = Depends(get_db)):
     item = db.query(models.WrongBook).filter(models.WrongBook.id == item_id).first()
     if item:
-        db.delete(item)
+        item.is_deleted = True
         db.commit()
     return {"code": 200, "message": "删除成功"}
+
 
 # --- 识别历史 删除接口 ---
 @app.delete("/api/user/recognize_history/clear")
 async def clear_recognize_history(user_id: int, db: Session = Depends(get_db)):
-    db.query(models.RecognizeHistory).filter(models.RecognizeHistory.user_id == user_id).delete()
+    db.query(models.RecognizeHistory).filter(
+        models.RecognizeHistory.user_id == user_id,
+        models.RecognizeHistory.is_deleted == False
+    ).update({"is_deleted": True})
     db.commit()
     return {"code": 200, "message": "清空成功"}
 
+
 @app.delete("/api/user/recognize_history/{item_id}")
 async def delete_recognize_history(item_id: int, db: Session = Depends(get_db)):
-    db.query(models.RecognizeHistory).filter(models.RecognizeHistory.id == item_id).delete()
-    db.commit()
+    item = db.query(models.RecognizeHistory).filter(models.RecognizeHistory.id == item_id).first()
+    if item:
+        item.is_deleted = True
+        db.commit()
     return {"code": 200, "message": "删除成功"}
 
-# --- 挑战历史 删除接口 (带扣分与掉段逻辑) ---
+
+# --- 挑战历史 删除接口 (仅隐藏记录，保留用户真实积分与段位) ---
 @app.delete("/api/user/challenge_history/clear")
 async def clear_challenge_history(user_id: int, db: Session = Depends(get_db)):
-    # 1. 查出该用户所有的挑战记录
-    histories = db.query(models.ChallengeHistory).filter(models.ChallengeHistory.user_id == user_id).all()
-    if not histories:
-        return {"code": 200, "message": "已清空"}
-
-    # 2. 计算要扣除的总分数
-    total_deduct = sum([h.score for h in histories])
-
-    # 3. 一键清空所有记录
-    db.query(models.ChallengeHistory).filter(models.ChallengeHistory.user_id == user_id).delete()
-
-    # 4. 联动扣分与掉段
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if user:
-        user.total_score = max(0, user.total_score - total_deduct)
-
-        new_title = "环保新手"
-        if user.total_score >= 100:
-            new_title = "环保王者"
-        elif user.total_score >= 50:
-            new_title = "环保达人"
-        elif user.total_score >= 20:
-            new_title = "环保卫士"
-
-        user.title = new_title
-
+    # 1. 逻辑删除所有挑战记录
+    db.query(models.ChallengeHistory).filter(
+        models.ChallengeHistory.user_id == user_id,
+        models.ChallengeHistory.is_deleted == False
+    ).update({"is_deleted": True})
     db.commit()
+
+    # 2. 获取用户当前积分(不扣分)，返回给前端，防止前端报错
+    user = db.query(models.User).filter(models.User.id == user_id).first()
     return {
         "code": 200,
         "message": "清空成功",
@@ -1429,39 +1518,20 @@ async def clear_challenge_history(user_id: int, db: Session = Depends(get_db)):
         }
     }
 
+
 @app.delete("/api/user/challenge_history/{item_id}")
 async def delete_challenge_history(item_id: int, db: Session = Depends(get_db)):
-    # 1. 先查出这条记录，获取要扣除的分数和用户ID
+    # 1. 查询该条记录
     history = db.query(models.ChallengeHistory).filter(models.ChallengeHistory.id == item_id).first()
     if not history:
         return {"code": 404, "message": "记录不存在"}
 
-    user_id = history.user_id
-    score_to_deduct = history.score
-
-    # 2. 删除记录
-    db.delete(history)
-
-    # 3. 联动扣除用户积分，并重新计算段位称号
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if user:
-        # 防止积分扣成负数
-        user.total_score = max(0, user.total_score - score_to_deduct)
-
-        # 重新评定称号
-        new_title = "环保新手"
-        if user.total_score >= 100:
-            new_title = "环保王者"
-        elif user.total_score >= 50:
-            new_title = "环保达人"
-        elif user.total_score >= 20:
-            new_title = "环保卫士"
-
-        user.title = new_title
-
+    # 2. 逻辑删除，不再扣除历史分数
+    history.is_deleted = True
     db.commit()
 
-    # 4. 把最新的积分和称号返回给前端，用于刷新缓存
+    # 3. 将用户当前的真实积分和称号返回给前端
+    user = db.query(models.User).filter(models.User.id == history.user_id).first()
     return {
         "code": 200,
         "message": "删除成功",
@@ -1471,17 +1541,24 @@ async def delete_challenge_history(item_id: int, db: Session = Depends(get_db)):
         }
     }
 
+
 # --- 反馈历史 删除接口 ---
 @app.delete("/api/user/feedback_history/clear")
 async def clear_feedback_history(user_id: int, db: Session = Depends(get_db)):
-    db.query(models.Feedback).filter(models.Feedback.user_id == user_id).delete()
+    db.query(models.Feedback).filter(
+        models.Feedback.user_id == user_id,
+        models.Feedback.is_deleted == False
+    ).update({"is_deleted": True})
     db.commit()
     return {"code": 200, "message": "清空成功"}
 
+
 @app.delete("/api/user/feedback_history/{item_id}")
 async def delete_feedback_history(item_id: int, db: Session = Depends(get_db)):
-    db.query(models.Feedback).filter(models.Feedback.id == item_id).delete()
-    db.commit()
+    item = db.query(models.Feedback).filter(models.Feedback.id == item_id).first()
+    if item:
+        item.is_deleted = True
+        db.commit()
     return {"code": 200, "message": "删除成功"}
 
 # 排行榜接口
