@@ -22,7 +22,7 @@ def build_inference_model():
 model = build_inference_model()
 
 # ... 后面的代码完全保持不变 ...
-weights_path = "weights/best_mobilenetv3.pth"
+weights_path = "weights/best_mobilenetv3_1_5_1.pth"
 if not os.path.exists(weights_path):
     print(f"❌ 找不到权重文件: {weights_path}，请检查路径！")
     exit()

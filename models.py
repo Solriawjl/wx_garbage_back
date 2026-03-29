@@ -72,7 +72,6 @@ class ChallengeHistory(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     score = Column(Integer, nullable=False, comment="得分")
     correct_count = Column(Integer, nullable=False, comment="答对题数")
-    earned_title = Column(String(50), nullable=False, comment="获得称号")
     created_at = Column(DateTime, server_default=func.now(), comment="答题时间")
     is_deleted = Column(Boolean, default=False, comment="逻辑删除状态: False-可见, True-用户已删除")
 
@@ -162,3 +161,69 @@ class LowConfidenceRecord(Base):
     confidence = Column(Numeric(5, 2), nullable=False, comment="当时的低置信度")
     status = Column(Integer, default=0, comment="0-待标注, 1-已打标入库, 2-废弃(如图片模糊)")
     created_at = Column(DateTime, server_default=func.now(), comment="收集时间")
+
+
+class PointRecord(Base):
+    """
+    积分流水表：记录用户积分的获取与消耗轨迹
+    """
+    __tablename__ = "point_records"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+    # 变动数量：获取为正数（如 +10），消耗为负数（如 -500）
+    change_amount = Column(Integer, nullable=False, comment="积分变动数量")
+
+    # 任务类型，用于后端防刷逻辑判定：
+    # 1: 每日首次拍照打卡
+    # 2: 每日阅读科普知识
+    # 3: 环保挑战得分
+    # 4: 商城积分兑换消耗
+    task_type = Column(Integer, nullable=False, comment="任务或行为类型")
+
+    # 具体的中文描述，方便前端直接展示给用户看
+    description = Column(String(100), nullable=False, comment="账单描述")
+
+    created_at = Column(DateTime, server_default=func.now(), comment="记录时间")
+
+
+# ==========================================
+# 积分商城模块 数据模型
+# ==========================================
+
+class MallItem(Base):
+    """
+    商城商品表
+    """
+    __tablename__ = "mall_items"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    name = Column(String(100), nullable=False, comment="商品名称")
+    desc = Column(String(200), comment="商品描述")
+    points_price = Column(Integer, nullable=False, comment="兑换所需积分")
+    image_url = Column(String(255), comment="商品图片")
+
+    # 库存设计：-1代表无限库存（如虚拟勋章），大于0代表实体商品真实库存
+    stock = Column(Integer, default=-1, comment="库存数量")
+
+    is_active = Column(Boolean, default=True, comment="是否上架")
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class RedemptionRecord(Base):
+    """
+    商品兑换记录（订单表）
+    """
+    __tablename__ = "redemption_records"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    item_id = Column(Integer, ForeignKey("mall_items.id"), nullable=False)
+
+    points_cost = Column(Integer, nullable=False, comment="当时花费的积分")
+
+    # 状态：0-待核销(未发货), 1-已核销(已完成)
+    status = Column(Integer, default=0, comment="核销状态")
+
+    created_at = Column(DateTime, server_default=func.now())

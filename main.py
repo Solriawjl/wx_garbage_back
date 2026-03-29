@@ -6,7 +6,7 @@ import os
 from sqlalchemy.sql.expression import func
 from sqlalchemy import desc
 import random
-from datetime import datetime
+from datetime import datetime,date
 from fastapi.middleware.cors import CORSMiddleware
 
 # 模型
@@ -73,7 +73,7 @@ def build_inference_model():
 ai_model = build_inference_model()
 try:
     # 替换为你实际的权重路径
-    ai_model.load_state_dict(torch.load("weights/best_mobilenetv3.pth", map_location=device, weights_only=True))
+    ai_model.load_state_dict(torch.load("weights/best_mobilenetv3_1_5.pth", map_location=device, weights_only=True))
     ai_model.to(device)
     ai_model.eval() # 切换到评估模式，关闭 Dropout 和 BatchNorm 的动态更新
     print("AI 模型权重加载成功！")
@@ -255,6 +255,20 @@ async def get_admin_menu():
                 "meta": {
                     "icon": "User",
                     "title": "小程序用户管理", # 用户信息
+                    "isLink": "",
+                    "isHide": False,
+                    "isFull": False,
+                    "isAffix": False,
+                    "isKeepAlive": True
+                }
+            },
+            {
+                "path": "/mall",
+                "name": "mallManage",
+                "component": "/mall/index",
+                "meta": {
+                    "icon": "Goods",
+                    "title": "积分商城管理",
                     "isLink": "",
                     "isHide": False,
                     "isFull": False,
@@ -762,6 +776,167 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
         }
     }
 
+# ==============================================================================
+# 后台管理系统 - 积分商城管理
+# ==============================================================================
+class AdminMallItemSchema(BaseModel):
+    name: str
+    desc: str
+    points_price: int
+    image_url: str
+    stock: int
+    is_active: bool
+
+
+# --- 1. 获取商品列表 (带分页和搜索) ---
+@app.get("/api/admin/mall/items")
+async def get_admin_mall_items(
+        pageNum: int = Query(1),
+        pageSize: int = Query(10),
+        name: str = Query(None),
+        db: Session = Depends(get_db)
+):
+    query = db.query(models.MallItem)
+    if name:
+        query = query.filter(models.MallItem.name.like(f"%{name}%"))
+
+    total = query.count()
+    skip = (pageNum - 1) * pageSize
+    items = query.order_by(models.MallItem.id.desc()).offset(skip).limit(pageSize).all()
+
+    list_data = []
+    for i in items:
+        list_data.append({
+            "id": i.id,
+            "name": i.name,
+            "desc": i.desc,
+            "points_price": i.points_price,
+            "image_url": i.image_url,
+            "stock": i.stock,
+            "is_active": i.is_active,
+            "created_at": i.created_at.strftime("%Y-%m-%d %H:%M:%S") if i.created_at else ""
+        })
+
+    return {"code": 200, "message": "成功",
+            "data": {"list": list_data, "total": total, "pageNum": pageNum, "pageSize": pageSize}}
+
+
+# --- 2. 新增商品 ---
+@app.post("/api/admin/mall/items")
+async def add_admin_mall_item(item_data: AdminMallItemSchema, db: Session = Depends(get_db)):
+    new_item = models.MallItem(**item_data.dict())
+    db.add(new_item)
+    db.commit()
+    return {"code": 200, "message": "新增成功", "data": None}
+
+
+# --- 3. 修改商品 ---
+@app.put("/api/admin/mall/items/{item_id}")
+async def edit_admin_mall_item(item_id: int, item_data: AdminMallItemSchema, db: Session = Depends(get_db)):
+    item = db.query(models.MallItem).filter(models.MallItem.id == item_id).first()
+    if not item: return {"code": 404, "message": "商品不存在"}
+
+    for key, value in item_data.dict().items():
+        setattr(item, key, value)
+
+    db.commit()
+    return {"code": 200, "message": "修改成功", "data": None}
+
+
+# --- 4. 批量删除商品 ---
+class AdminDeleteMallSchema(BaseModel):
+    id: list[int]
+
+
+@app.post("/api/admin/mall/items/delete")
+async def delete_admin_mall_items(req: AdminDeleteMallSchema, db: Session = Depends(get_db)):
+    db.query(models.MallItem).filter(models.MallItem.id.in_(req.id)).delete(synchronize_session=False)
+    db.commit()
+    return {"code": 200, "message": "删除成功", "data": None}
+
+
+# 1. 定义 Pydantic Schema 用于接收参数
+class RefundSchema(BaseModel):
+    user_id: int
+    redemption_id: int
+
+
+# ==========================================
+# 处理退货反悔逻辑 (严格事务防刷)
+# ==========================================
+@app.post("/api/mall/refund")
+async def refund_mall_item(req: RefundSchema, db: Session = Depends(get_db)):
+    # 1. 查出该订单记录
+    record = db.query(models.RedemptionRecord).filter(
+        models.RedemptionRecord.id == req.redemption_id,
+        models.RedemptionRecord.user_id == req.user_id
+    ).first()
+
+    if not record:
+        return {"code": 404, "message": "该兑换记录不存在"}
+
+    # 2. 核心逻辑校验：只有“待核销”状态才能反悔
+    if record.status != 0:
+        if record.status == 1:
+            return {"code": 400, "message": "商品已核销发货，无法退货哦。可以找老师线下沟通"}
+        else:
+            return {"code": 400, "message": "该订单已是退货状态，无法重复操作"}
+
+    # ============= 开始事务操作 =============
+    try:
+        # 3. 查人、查商品
+        user = db.query(models.User).filter(models.User.id == req.user_id).first()
+        item = db.query(models.MallItem).filter(models.MallItem.id == record.item_id).first()
+
+        if not user or not item:
+            raise Exception("用户或商品已不在，事务回滚")
+
+        # 4. 原路退回用户积分
+        user.total_score += record.points_cost
+
+        # 重新计算称号 (防掉段反而是毕设里不必要的复杂逻辑，我们直接加回积分并升称号)
+        if user.total_score >= 500:
+            user.title = "环保宗师"
+        elif user.total_score >= 200:
+            user.title = "环保达人"
+        elif user.total_score >= 50:
+            user.title = "环保卫士"
+        else:
+            user.title = "环保新手"
+
+        # 5. 写入积分流水账单 (task_type=5 为商城退款)
+        point_record = models.PointRecord(
+            user_id=user.id,
+            change_amount=record.points_cost,  # 退款是正数
+            task_type=5,
+            description=f"兑换反悔退款：{item.name}"
+        )
+        db.add(point_record)
+
+        # 6. 将订单状态标记为 2-已退货
+        record.status = 2
+        # 可选：记录退款时间
+        # record.updated_at = datetime.now()
+
+        # 7. 退回真实库存
+        if item.stock != -1:  # 如果是限量实体商品
+            item.stock += 1
+
+        db.commit()
+
+        return {
+            "code": 200,
+            "message": "反悔成功！积分已原路退回",
+            "data": {
+                "new_score": user.total_score,
+                "new_title": user.title
+            }
+        }
+    except Exception as e:
+        db.rollback()
+        print("退货发生异常：", e)
+        return {"code": 500, "message": "服务器开小差了，反悔失败"}
+
 @app.get("/")
 def read_root():
     return {"message": "垃圾分类后端服务已成功启动！"}
@@ -800,6 +975,53 @@ def wechat_login(request_data: schemas.WxLoginRequest, db: Session = Depends(get
 
     return user
 
+
+# ==========================================
+# 处理每日任务积分奖励与防刷校验
+# ==========================================
+def check_and_award_daily_task(user_id: int, task_type: int, reward_amount: int, description: str, db: Session) -> int:
+    """
+    通用防刷奖励机制
+    :return: 实际获得的积分（若今天已完成则返回 0）
+    """
+    today = date.today()
+
+    # 1. 查询流水表，检查今天是否已完成该类型任务
+    daily_record = db.query(models.PointRecord).filter(
+        models.PointRecord.user_id == user_id,
+        models.PointRecord.task_type == task_type,
+        func.date(models.PointRecord.created_at) == today
+    ).first()
+
+    # 2. 如果今天没做过，发放奖励
+    if not daily_record:
+        # 写入积分流水
+        new_record = models.PointRecord(
+            user_id=user_id,
+            change_amount=reward_amount,
+            task_type=task_type,
+            description=description
+        )
+        db.add(new_record)
+
+        # 更新用户总积分及称号（自动检测升段）
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if user:
+            user.total_score += reward_amount
+            if user.total_score >= 500:
+                user.title = "环保宗师"
+            elif user.total_score >= 200:
+                user.title = "环保达人"
+            elif user.total_score >= 50:
+                user.title = "环保卫士"
+            else:
+                user.title = "环保新手"
+
+        db.commit()
+        return reward_amount
+
+    # 今天已经做过了，返回 0
+    return 0
 
 # ==========================================
 # 接口：AI 图像识别 (真实 AI 推理版)
@@ -898,7 +1120,16 @@ async def recognize_garbage(
     db.add(new_history)
     db.commit()
 
-    # 组装给前端的返回结果（加入教育闭环和推荐列表）
+    # 触发每日首次拍照奖励 (task_type=1)
+    reward_points = check_and_award_daily_task(
+        user_id=user_id,
+        task_type=1,
+        reward_amount=10,
+        description="每日首次拍照打卡奖励",
+        db=db
+    )
+
+    # 组装给前端的返回结果（加入奖励积分）
     mock_result = {
         "user_id": user_id,
         "image_path": cos_image_url,
@@ -907,19 +1138,16 @@ async def recognize_garbage(
         "category_name": category_info.category_name,
         "category_class": category_info.category_class,
 
-        # 原有基础字段
         "eco_value": category_info.eco_value,
         "put_guidance": category_info.put_guidance,
-
-        # 新增教育闭环与日式严谨标准字段
         "harm_description": category_info.harm_description,
         "process_method": category_info.process_method,
         "sub_guidance": category_info.sub_guidance,
 
-        # 猜你想扔的具体物品列表
-        "recommend_items": recommend_list
+        "recommend_items": recommend_list,
+        "reward_points": reward_points  # 把获得的积分传给前端
     }
-    # print("准备发给前端的数据：", mock_result)
+
     return {
         "code": 200,
         "message": "图片上传成功！AI识别完成",
@@ -987,7 +1215,15 @@ async def recognize_garbage_edge(
     db.add(new_history)
     db.commit()
 
-    # 4. 组装结果返回给前端展示（加入教育闭环）
+    reward_points = check_and_award_daily_task(
+        user_id=user_id,
+        task_type=1,
+        reward_amount=10,
+        description="每日首次拍照打卡奖励",
+        db=db
+    )
+
+    # 4. 组装结果返回给前端展示
     mock_result = {
         "user_id": user_id,
         "image_path": cos_image_url,
@@ -996,17 +1232,16 @@ async def recognize_garbage_edge(
         "category_name": category_info.category_name,
         "category_class": category_info.category_class,
 
-        # 教育闭环与科普字段
         "eco_value": category_info.eco_value,
         "put_guidance": category_info.put_guidance,
         "harm_description": category_info.harm_description,
         "process_method": category_info.process_method,
         "sub_guidance": category_info.sub_guidance,
 
-        # 推荐物品列表
-        "recommend_items": recommend_list
+        "recommend_items": recommend_list,
+        "reward_points": reward_points
     }
-    # print("准备发给前端的数据：", mock_result)
+
     return {
         "code": 200,
         "message": "端云协同处理成功",
@@ -1226,6 +1461,40 @@ async def get_tips_list(
     }
 
 
+from pydantic import BaseModel
+
+
+class ReadTaskSchema(BaseModel):
+    user_id: int
+
+
+# ==========================================
+# 完成每日阅读科普任务打卡
+# ==========================================
+@app.post("/api/task/read_tip")
+async def finish_read_task(req: ReadTaskSchema, db: Session = Depends(get_db)):
+    # 直接复用我们上次写的“瑞士军刀”函数！
+    # task_type=2 代表阅读打卡，奖励 15 积分
+    reward_points = check_and_award_daily_task(
+        user_id=req.user_id,
+        task_type=2,
+        reward_amount=15,
+        description="每日科普阅读打卡奖励",
+        db=db
+    )
+
+    # 顺便查一下用户最新总积分返回去
+    user = db.query(models.User).filter(models.User.id == req.user_id).first()
+
+    return {
+        "code": 200,
+        "message": "阅读记录成功",
+        "data": {
+            "reward_points": reward_points,
+            "total_score": user.total_score if user else 0,
+            "title": user.title if user else "环保新手"
+        }
+    }
 # ==========================================
 # 接口：随机生成挑战题目
 # ==========================================
@@ -1242,6 +1511,7 @@ async def get_challenge_questions(limit: int = 10, db: Session = Depends(get_db)
         question_list.append({
             "id": item.id,
             "item_name": item.item_name,
+            "image_url": item.image_url,
             "correct_category_id": item.category_type,
             "correct_category_name": category.category_name if category else "未知",
             "tips": item.tips
@@ -1269,9 +1539,9 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
     if user.total_score >= 500:
         new_title = "环保宗师"
     elif user.total_score >= 200:
-        new_title = "环保卫士"
-    elif user.total_score >= 50:
         new_title = "环保达人"
+    elif user.total_score >= 50:
+        new_title = "环保卫士"
     else:
         new_title = "环保新手"
 
@@ -1280,8 +1550,7 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
     new_history = models.ChallengeHistory(
         user_id=user.id,
         score=quiz_data.score,
-        correct_count=quiz_data.correct_count,
-        earned_title=new_title
+        correct_count=quiz_data.correct_count
     )
     db.add(new_history)
 
@@ -1296,12 +1565,21 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
 
     db.commit()
 
+    current_performance = "再接再厉"  # 0-3分
+    if quiz_data.score == 10:
+        current_performance = "完美通关"
+    elif quiz_data.score >= 8:
+        current_performance = "火眼金睛"
+    elif quiz_data.score >= 5:
+        current_performance = "渐入佳境"
+
     return {
         "code": 200,
         "message": "交卷成功！",
         "data": {
             "total_score": user.total_score,
-            "current_title": user.title
+            "current_title": user.title,
+            "performance": current_performance
         }
     }
 
@@ -1343,8 +1621,16 @@ async def get_user_info(user_id: int, db: Session = Depends(get_db)):
     if not user:
         return {"code": 404, "message": "用户不存在", "data": None}
 
-    recognize_count = db.query(models.RecognizeHistory).filter(models.RecognizeHistory.user_id == user_id).count()
-    challenge_count = db.query(models.ChallengeHistory).filter(models.ChallengeHistory.user_id == user_id).count()
+    # 加上 is_deleted == False，保证用户主页的统计数字和列表里看到的一致
+    recognize_count = db.query(models.RecognizeHistory).filter(
+        models.RecognizeHistory.user_id == user_id,
+        models.RecognizeHistory.is_deleted == False
+    ).count()
+
+    challenge_count = db.query(models.ChallengeHistory).filter(
+        models.ChallengeHistory.user_id == user_id,
+        models.ChallengeHistory.is_deleted == False
+    ).count()
 
     return {
         "code": 200,
@@ -1379,66 +1665,104 @@ async def get_recognize_history(user_id: int, db: Session = Depends(get_db)):
         })
     return {"code": 200, "data": result}
 
-
-# 3. 获取挑战历史列表
+# 3. 获取挑战历史列表 (通过时间戳智能匹配错题本)
 @app.get("/api/user/challenge_history")
 async def get_challenge_history(user_id: int, db: Session = Depends(get_db)):
     histories = db.query(models.ChallengeHistory).filter(
         models.ChallengeHistory.user_id == user_id,
-        models.RecognizeHistory.is_deleted == False
+        models.ChallengeHistory.is_deleted == False
     ).order_by(desc(models.ChallengeHistory.created_at)).all()
 
     result = []
     for h in histories:
-        t_class = 'level-1'
-        if h.earned_title in ['环保王者', '环保宗师']:
-            t_class = 'level-4'
-        elif h.earned_title == '环保达人':
-            t_class = 'level-3'
-        elif h.earned_title == '环保卫士':
-            t_class = 'level-2'
+        # 根据已有的 h.score 动态计算评级
+        if h.score == 10:
+            perf_text = "完美通关"
+            t_class = "level-4"
+        elif h.score >= 8:
+            perf_text = "火眼金睛"
+            t_class = "level-3"
+        elif h.score >= 5:
+            perf_text = "渐入佳境"
+            t_class = "level-2"
+        else:
+            perf_text = "再接再厉"
+            t_class = "level-1"
+
+        # 通过 created_at 匹配当时产生的错题记录
+        wrong_list_formatted = []
+        if h.created_at:
+            # 设定前后 2 秒的时间窗口，防止跨表写入的毫秒级延迟导致查不到
+            time_lower = h.created_at - timedelta(seconds=2)
+            time_upper = h.created_at + timedelta(seconds=2)
+
+            matched_wrongs = db.query(models.WrongBook).filter(
+                models.WrongBook.user_id == user_id,
+                models.WrongBook.created_at >= time_lower,
+                models.WrongBook.created_at <= time_upper,
+                models.WrongBook.is_deleted == False  # 严谨起见，过滤掉已被逻辑删除的错题
+            ).all()
+
+            for w in matched_wrongs:
+                wrong_list_formatted.append({
+                    "name": w.item_name,
+                    "userSelect": w.user_answer,
+                    "correctAnswer": w.correct_answer
+                })
 
         result.append({
             "id": str(h.id),
             "score": h.score,
             "correctCount": h.correct_count,
-            "title": h.earned_title,
+            "title": perf_text,
             "titleClass": t_class,
             "date": h.created_at.strftime("%Y-%m-%d %H:%M") if h.created_at else "",
-            "wrongList": []
+            "wrongList": wrong_list_formatted
         })
+
     return {"code": 200, "data": result}
 
 
 # 4. 获取我的错题本
 @app.get("/api/user/wrong_book")
 async def get_wrong_book(user_id: int, db: Session = Depends(get_db)):
-    wrongs = db.query(models.WrongBook).filter(
+    histories = db.query(models.WrongBook).filter(
         models.WrongBook.user_id == user_id,
-        models.RecognizeHistory.is_deleted == False
+        models.WrongBook.is_deleted == False
     ).order_by(desc(models.WrongBook.created_at)).all()
 
-    result = []
-    for w in wrongs:
-        result.append({
-            "id": str(w.id),
-            "name": w.item_name,
-            "userSelect": w.user_answer,
-            "correctAnswer": w.correct_answer
-        })
+    # 2. 核心逻辑：利用字典进行“读时聚合”去重并统计次数
+    unique_wrongs = {}
+    for w in histories:
+        if w.item_name not in unique_wrongs:
+            # 如果是第一次遍历到这个垃圾（因为是时间倒序，这一定是最近一次做错的记录）
+            unique_wrongs[w.item_name] = {
+                "id": str(w.id),
+                "name": w.item_name,
+                "userSelect": w.user_answer,  # 保留最新一次选错的答案
+                "correctAnswer": w.correct_answer,
+                "errorCount": 1  # 初始次数为 1
+            }
+        else:
+            # 如果字典里已经有了，说明历史上也错过，只增加错误次数，其他信息保留最新的
+            unique_wrongs[w.item_name]["errorCount"] += 1
+
+    # 3. 将字典的值转化为列表返回给前端
+    result = list(unique_wrongs.values())
+
     return {"code": 200, "data": result}
 
 
 # 7. 获取反馈历史列表
 @app.get("/api/user/feedback_history")
 async def get_feedback_history(user_id: int, db: Session = Depends(get_db)):
-    feedbacks = db.query(models.Feedback).filter(
+    histories = db.query(models.Feedback).filter(
         models.Feedback.user_id == user_id,
-        models.RecognizeHistory.is_deleted == False
+        models.Feedback.is_deleted == False
     ).order_by(desc(models.Feedback.created_at)).all()
 
     result = []
-    for f in feedbacks:
+    for f in histories:
         type_str = f.type.value if hasattr(f.type, 'value') else f.type
 
         result.append({
@@ -1450,6 +1774,28 @@ async def get_feedback_history(user_id: int, db: Session = Depends(get_db)):
             "status": f.status,
             "adminReply": f.admin_reply,
             "date": f.created_at.strftime("%Y-%m-%d %H:%M") if f.created_at else ""
+        })
+    return {"code": 200, "data": result}
+
+# 8. 获取我的兑换记录 (联表查询商城商品)
+@app.get("/api/user/redemption_history")
+async def get_redemption_history(user_id: int, db: Session = Depends(get_db)):
+    # 联表查询 RedemptionRecord 和 MallItem
+    records = db.query(models.RedemptionRecord, models.MallItem).join(
+        models.MallItem, models.RedemptionRecord.item_id == models.MallItem.id
+    ).filter(
+        models.RedemptionRecord.user_id == user_id
+    ).order_by(desc(models.RedemptionRecord.created_at)).all()
+
+    result = []
+    for record, item in records:
+        result.append({
+            "id": str(record.id),
+            "itemName": item.name,
+            "imageUrl": item.image_url if item.image_url else "/images/default_item.png",
+            "pointsCost": record.points_cost,
+            "status": record.status,  # 0:待核销, 1:已完成
+            "date": record.created_at.strftime("%Y-%m-%d %H:%M") if record.created_at else ""
         })
     return {"code": 200, "data": result}
 
@@ -1639,3 +1985,105 @@ def update_avatar(user_id: int = Form(...), file: UploadFile = File(...), db: Se
         "data": {"avatar_url": cos_url}
     }
 
+
+class RedeemSchema(BaseModel):
+    user_id: int
+    item_id: int
+
+
+# ==========================================
+# 小程序接口：获取商城在售商品列表
+# ==========================================
+@app.get("/api/mall/items")
+async def get_mall_items(db: Session = Depends(get_db)):
+    # 只查处于上架状态的商品
+    items = db.query(models.MallItem).filter(models.MallItem.is_active == True).order_by(
+        models.MallItem.points_price.asc()).all()
+
+    result = []
+    for item in items:
+        result.append({
+            "id": item.id,
+            "name": item.name,
+            "desc": item.desc,
+            "points": item.points_price,
+            "image": item.image_url if item.image_url else "/images/default_item.png",
+            "stock": item.stock
+        })
+    return {"code": 200, "message": "获取成功", "data": result}
+
+
+# ==========================================
+# 核心兑换逻辑 (防超卖、防扣负)
+# ==========================================
+@app.post("/api/mall/redeem")
+async def redeem_mall_item(req: RedeemSchema, db: Session = Depends(get_db)):
+    # 1. 查人、查商品
+    user = db.query(models.User).filter(models.User.id == req.user_id).first()
+    item = db.query(models.MallItem).filter(models.MallItem.id == req.item_id).first()
+
+    if not user or not item:
+        return {"code": 404, "message": "用户或商品不存在"}
+
+    if not item.is_active:
+        return {"code": 400, "message": "该商品已下架"}
+
+    # 2. 检查库存 (如果是 -1 则代表无限)
+    if item.stock == 0:
+        return {"code": 400, "message": "手慢啦，商品已兑换完"}
+
+    # 3. 检查积分是否足够
+    if user.total_score < item.points_price:
+        return {"code": 400, "message": "积分不足，快去赚积分吧！"}
+
+    # ============= 开始事务操作 =============
+    try:
+        # 4. 扣除用户积分 (注意：这里如果想让用户花积分不掉段位，其实更好的设计是增加一个 current_score 字段，但为了简单，我们直接扣减 total_score，并重新计算段位)
+        user.total_score -= item.points_price
+
+        # 重新计算称号
+        if user.total_score >= 500:
+            user.title = "环保宗师"
+        elif user.total_score >= 200:
+            user.title = "环保达人"
+        elif user.total_score >= 50:
+            user.title = "环保卫士"
+        else:
+            user.title = "环保新手"
+
+        # 5. 写入积分流水账单 (我们在 models.py 里约定 task_type=4 为商城兑换)
+        point_record = models.PointRecord(
+            user_id=user.id,
+            change_amount=-item.points_price,  # 消费是负数
+            task_type=4,
+            description=f"商城兑换：{item.name}"
+        )
+        db.add(point_record)
+
+        # 6. 生成兑换订单 (RedemptionRecord)
+        redemption = models.RedemptionRecord(
+            user_id=user.id,
+            item_id=item.id,
+            points_cost=item.points_price,
+            status=0  # 默认为0待核销
+        )
+        db.add(redemption)
+
+        # 7. 扣减真实库存
+        if item.stock > 0:
+            item.stock -= 1
+
+        db.commit()
+
+        return {
+            "code": 200,
+            "message": "兑换成功",
+            "data": {
+                "new_score": user.total_score,
+                "new_title": user.title
+            }
+        }
+    except Exception as e:
+        db.rollback()
+        print("兑换发生异常：", e)
+        return {"code": 500, "message": "服务器开小差了，请稍后重试"}
