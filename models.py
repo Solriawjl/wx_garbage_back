@@ -24,6 +24,7 @@ class User(Base):
     nickname = Column(String(100), default="微信用户", comment="用户昵称")
     avatar_url = Column(String(255), nullable=True, comment="用户头像链接")
     total_score = Column(Integer, default=0, comment="答题总积分")
+    eco_coin = Column(Integer, default=0, comment="环保币(用于商城消费)")
     title = Column(String(50), default="环保新手", comment="当前环保称号")
     created_at = Column(DateTime, server_default=func.now(), comment="注册时间")
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), comment="最后更新时间")
@@ -227,3 +228,4 @@ class RedemptionRecord(Base):
     status = Column(Integer, default=0, comment="核销状态")
 
     created_at = Column(DateTime, server_default=func.now())
+

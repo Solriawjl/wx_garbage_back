@@ -593,6 +593,7 @@ async def get_admin_users(
             "nickname": u.nickname or "微信用户",
             "avatar_url": u.avatar_url or "",
             "score": u.total_score ,  # 积分段位
+            "eco_coin": u.eco_coin,
             "title": u.title if hasattr(u, 'title') and u.title else "环保新手",
             "created_at": u.created_at.strftime("%Y-%m-%d %H:%M:%S") if u.created_at else ""
         })
@@ -891,18 +892,8 @@ async def refund_mall_item(req: RefundSchema, db: Session = Depends(get_db)):
         if not user or not item:
             raise Exception("用户或商品已不在，事务回滚")
 
-        # 4. 原路退回用户积分
-        user.total_score += record.points_cost
-
-        # 重新计算称号 (防掉段反而是毕设里不必要的复杂逻辑，我们直接加回积分并升称号)
-        if user.total_score >= 500:
-            user.title = "环保宗师"
-        elif user.total_score >= 200:
-            user.title = "环保达人"
-        elif user.total_score >= 50:
-            user.title = "环保卫士"
-        else:
-            user.title = "环保新手"
+        # 4. 原路退回用户【环保币】
+        user.eco_coin += record.points_cost
 
         # 5. 写入积分流水账单 (task_type=5 为商城退款)
         point_record = models.PointRecord(
@@ -1004,18 +995,10 @@ def check_and_award_daily_task(user_id: int, task_type: int, reward_amount: int,
         )
         db.add(new_record)
 
-        # 更新用户总积分及称号（自动检测升段）
+        # 日常任务只增加环保币 (eco_coin)
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if user:
-            user.total_score += reward_amount
-            if user.total_score >= 500:
-                user.title = "环保宗师"
-            elif user.total_score >= 200:
-                user.title = "环保达人"
-            elif user.total_score >= 50:
-                user.title = "环保卫士"
-            else:
-                user.title = "环保新手"
+            user.eco_coin += reward_amount  # 只加环保币
 
         db.commit()
         return reward_amount
@@ -1565,6 +1548,16 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
 
     db.commit()
 
+    # 每日首次挑战奖励（task_type=3 约定为挑战打卡）
+    # 给用户发放 20 个环保币
+    reward_eco_coin = check_and_award_daily_task(
+        user_id=user.id,
+        task_type=3,
+        reward_amount=20,
+        description="每日首次挑战打卡奖励",
+        db=db
+    )
+
     current_performance = "再接再厉"  # 0-3分
     if quiz_data.score == 10:
         current_performance = "完美通关"
@@ -1579,7 +1572,8 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
         "data": {
             "total_score": user.total_score,
             "current_title": user.title,
-            "performance": current_performance
+            "performance": current_performance,
+            "reward_eco_coin": reward_eco_coin
         }
     }
 
@@ -1636,6 +1630,7 @@ async def get_user_info(user_id: int, db: Session = Depends(get_db)):
         "code": 200,
         "data": {
             "total_score": user.total_score,
+            "eco_coin": user.eco_coin,
             "title": user.title,
             "recognize_count": recognize_count,
             "challenge_count": challenge_count
@@ -2032,24 +2027,14 @@ async def redeem_mall_item(req: RedeemSchema, db: Session = Depends(get_db)):
     if item.stock == 0:
         return {"code": 400, "message": "手慢啦，商品已兑换完"}
 
-    # 3. 检查积分是否足够
-    if user.total_score < item.points_price:
-        return {"code": 400, "message": "积分不足，快去赚积分吧！"}
+    # 3. 检查【环保币】是否足够
+    if user.eco_coin < item.points_price:
+        return {"code": 400, "message": "环保币不足，快去拍照打卡吧！"}
 
     # ============= 开始事务操作 =============
     try:
-        # 4. 扣除用户积分 (注意：这里如果想让用户花积分不掉段位，其实更好的设计是增加一个 current_score 字段，但为了简单，我们直接扣减 total_score，并重新计算段位)
-        user.total_score -= item.points_price
-
-        # 重新计算称号
-        if user.total_score >= 500:
-            user.title = "环保宗师"
-        elif user.total_score >= 200:
-            user.title = "环保达人"
-        elif user.total_score >= 50:
-            user.title = "环保卫士"
-        else:
-            user.title = "环保新手"
+        # 4. 扣除用户【环保币】
+        user.eco_coin -= item.points_price
 
         # 5. 写入积分流水账单 (我们在 models.py 里约定 task_type=4 为商城兑换)
         point_record = models.PointRecord(
@@ -2079,7 +2064,7 @@ async def redeem_mall_item(req: RedeemSchema, db: Session = Depends(get_db)):
             "code": 200,
             "message": "兑换成功",
             "data": {
-                "new_score": user.total_score,
+                "new_score": user.eco_coin,
                 "new_title": user.title
             }
         }
