@@ -1084,11 +1084,11 @@ async def recognize_garbage(
 
     # 低置信度难例自动拦截入库逻辑
     CONFIDENCE_THRESHOLD = 70.0  # 设置阈值
-    if confidence < CONFIDENCE_THRESHOLD:
+    if conf_val < CONFIDENCE_THRESHOLD:  # 使用 conf_val (85.11) 进行比较
         new_hard_example = models.LowConfidenceRecord(
             image_url=cos_image_url,
             ai_predicted_category=category_info.id,
-            confidence=confidence
+            confidence=conf_val  # 将普通的 float 存入数据库
         )
         db.add(new_hard_example)
 
