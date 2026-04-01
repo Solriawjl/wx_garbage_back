@@ -133,6 +133,10 @@ class QuizSubmitRequest(BaseModel):
     score: int            # 本次得分 (比如答对1题得10分)
     correct_count: int    # 答对题数
     wrong_answers: List[QuizWrongAnswer] = [] # 错题数组，全对就是空数组
+    mode: Optional[str] = "classic"
+    total_count: Optional[int] = 10
+    time_used: Optional[int] = 0  # 用户实际耗时(秒)
+    total_time: Optional[int] = 60  # 该局总时长(秒)
 
 # ==========================================
 # 9. 纠错反馈提交 (Feedback Submit) Schema

@@ -521,45 +521,69 @@ async def audit_admin_feedback(req: AuditFeedbackSchema, db: Session = Depends(g
     if not feedback:
         return {"code": 404, "message": "反馈记录不存在"}
 
+    # 记录修改前的原始状态
+    original_status = feedback.status
+
     feedback.status = req.status
     feedback.admin_reply = req.admin_reply
 
-    # 【核心逻辑：真实采纳入库】
-    # 如果状态是 1(采纳)，且有图片URL，且是图片类型的反馈
+    # 【逻辑1：图片数据飞轮入库 (仅限图片类型的采纳)】
     if req.status == 1 and feedback.image_url and feedback.type in ["image", "图片"]:
         try:
-            # 1. 数据清洗：提取纯净的四大类名称
             raw_suggestion = feedback.suggestion if feedback.suggestion else ""
             correct_category = "未分类"
-            # 无论后缀带了什么，只要包含了这四个关键字，就精准归类
             for standard_cat in ["可回收物", "有害垃圾", "厨余垃圾", "其他垃圾"]:
                 if standard_cat in raw_suggestion:
                     correct_category = standard_cat
                     break
 
-            # 2. 确定保存目录 (现在它只会生成四大类标准文件夹了)
             save_dir = os.path.join("E:/wechat/feedback_image", "train", correct_category)
             os.makedirs(save_dir, exist_ok=True)
 
-            # 3. 下载图片
             response = requests.get(feedback.image_url, timeout=10)
             if response.status_code == 200:
-                # 生成唯一文件名
                 file_name = f"feedback_{uuid.uuid4().hex[:8]}.jpg"
                 file_path = os.path.join(save_dir, file_name)
-
-                # 4. 写入文件
                 with open(file_path, "wb") as f:
                     f.write(response.content)
-                print(f"✅ 飞轮运转：已成功将纠错照片采纳入训练集 -> {file_path}")
-            else:
-                print(f"⚠️ 图片下载失败，HTTP状态码: {response.status_code}")
-
+                print(f"飞轮运转：已成功将纠错照片采纳入训练集 -> {file_path}")
         except Exception as e:
-            print(f"❌ 采纳图片处理时发生异常: {e}")
+            print(f"采纳图片处理时发生异常: {e}")
+
+    # ==========================================
+    # 【逻辑2：独立的环保币发放/扣回逻辑】
+    # ==========================================
+
+    # 场景A：首次被采纳 (无论图片还是文本纠错，都给钱)
+    if req.status == 1 and original_status != 1:
+        user = db.query(models.User).filter(models.User.id == feedback.user_id).first()
+        if user:
+            user.eco_coin += 5  # 增加 5 个环保币
+
+            new_record = models.PointRecord(
+                user_id=user.id,
+                change_amount=5,
+                task_type=6,  # 约定 6 代表纠错奖励
+                description=f"纠错被采纳奖励：{feedback.item_name}"
+            )
+            db.add(new_record)
+
+    # 场景B：管理员误操作点成采纳，后又修改为驳回 (需要把错发的钱扣回来)
+    elif req.status == 2 and original_status == 1:
+        user = db.query(models.User).filter(models.User.id == feedback.user_id).first()
+        if user:
+            user.eco_coin -= 5  # 追回 5 个环保币
+
+            new_record = models.PointRecord(
+                user_id=user.id,
+                change_amount=-5,
+                task_type=6,
+                description=f"纠错重新驳回，扣除奖励：{feedback.item_name}"
+            )
+            db.add(new_record)
 
     db.commit()
-    return {"code": 200, "message": "审核完成，数据已入库", "data": None}
+    return {"code": 200, "message": "审核完成，数据状态已同步", "data": None}
 
 # ==============================================================================
 # 后台管理系统 - 小程序用户管理模块
@@ -1516,7 +1540,60 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
     if not user:
         return {"code": 404, "message": "用户不存在"}
 
-    user.total_score += quiz_data.score
+    # ==========================================
+    # 根据双模式规则，后端权威计算得分
+    # ==========================================
+    calculated_score = 0
+    accuracy = quiz_data.correct_count / quiz_data.total_count if quiz_data.total_count > 0 else 0
+    current_performance = "再接再厉"
+
+    if quiz_data.mode == "timed":
+        # 【计时模式】基础分 15
+        base_score = 15
+        bonus = 0
+        time_ratio = quiz_data.time_used / quiz_data.total_time if quiz_data.total_time > 0 else 1.0
+
+        # 规则 1：全对 且 用时 <= 60%
+        if accuracy == 1.0 and time_ratio <= 0.6:
+            bonus = 30
+            current_performance = "极限王者"  # 稀有表现
+        # 规则 2：正确率 >= 80% 且 未超时
+        elif accuracy >= 0.8 and quiz_data.time_used <= quiz_data.total_time:
+            bonus = 15
+            current_performance = "极速达人"
+        # 规则 3：及格线或超时
+        elif accuracy >= 0.5:
+            bonus = 5
+            current_performance = "游刃有余"
+        else:
+            current_performance = "眼疾手快"  # 参与安慰奖
+
+        calculated_score = base_score + bonus
+
+    else:
+        # 【经典模式】基础分 10
+        base_score = 10
+        bonus = 0
+
+        # 规则 1：100% 全对
+        if accuracy == 1.0:
+            bonus = 15
+            current_performance = "完美通关"
+        # 规则 2：正确率 >= 80%
+        elif accuracy >= 0.8:
+            bonus = 5
+            current_performance = "火眼金睛"
+        elif accuracy >= 0.5:
+            current_performance = "渐入佳境"
+        else:
+            current_performance = "再接再厉"
+
+        calculated_score = base_score + bonus
+
+    # ==========================================
+
+    # 更新用户总分和环保称号
+    user.total_score += calculated_score
 
     new_title = user.title
     if user.total_score >= 500:
@@ -1527,16 +1604,19 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
         new_title = "环保卫士"
     else:
         new_title = "环保新手"
-
     user.title = new_title
 
+    # 存入历史记录
     new_history = models.ChallengeHistory(
         user_id=user.id,
-        score=quiz_data.score,
-        correct_count=quiz_data.correct_count
+        score=calculated_score,
+        correct_count=quiz_data.correct_count,
+        mode=quiz_data.mode,
+        total_count=quiz_data.total_count
     )
     db.add(new_history)
 
+    # 存入错题本
     for wrong_item in quiz_data.wrong_answers:
         new_wrong = models.WrongBook(
             user_id=user.id,
@@ -1548,35 +1628,23 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
 
     db.commit()
 
-    # 每日首次挑战奖励（task_type=3 约定为挑战打卡）
-    # 给用户发放 20 个环保币
+    # 每日首次挑战奖励 (奖励 20 环保币)
     reward_eco_coin = check_and_award_daily_task(
-        user_id=user.id,
-        task_type=3,
-        reward_amount=20,
-        description="每日首次挑战打卡奖励",
-        db=db
+        user_id=user.id, task_type=3, reward_amount=20,
+        description="每日首次挑战打卡奖励", db=db
     )
-
-    current_performance = "再接再厉"  # 0-3分
-    if quiz_data.score == 10:
-        current_performance = "完美通关"
-    elif quiz_data.score >= 8:
-        current_performance = "火眼金睛"
-    elif quiz_data.score >= 5:
-        current_performance = "渐入佳境"
 
     return {
         "code": 200,
         "message": "交卷成功！",
         "data": {
+            "earned_score": calculated_score,  # 将真实得分返回给前端展示
             "total_score": user.total_score,
             "current_title": user.title,
             "performance": current_performance,
             "reward_eco_coin": reward_eco_coin
         }
     }
-
 
 # ==========================================
 # 接口：提交纠错反馈
@@ -1670,19 +1738,29 @@ async def get_challenge_history(user_id: int, db: Session = Depends(get_db)):
 
     result = []
     for h in histories:
-        # 根据已有的 h.score 动态计算评级
-        if h.score == 10:
-            perf_text = "完美通关"
-            t_class = "level-4"
-        elif h.score >= 8:
-            perf_text = "火眼金睛"
-            t_class = "level-3"
-        elif h.score >= 5:
-            perf_text = "渐入佳境"
-            t_class = "level-2"
+        # 兼容老数据（如果老数据没这两个字段，默认为经典模式）
+        mode = getattr(h, 'mode', 'classic')
+        total_count = getattr(h, 'total_count', 10)
+
+        # 针对不同模式，采用不同的称号评级逻辑
+        if mode == 'timed':
+            if h.correct_count >= 20:
+                perf_text, t_class = "手速王者", "level-4"
+            elif h.correct_count >= 15:
+                perf_text, t_class = "极速达人", "level-3"
+            elif h.correct_count >= 10:
+                perf_text, t_class = "游刃有余", "level-2"
+            else:
+                perf_text, t_class = "眼疾手快", "level-1"
         else:
-            perf_text = "再接再厉"
-            t_class = "level-1"
+            if h.correct_count >= 10:
+                perf_text, t_class = "完美通关", "level-4"
+            elif h.correct_count >= 8:
+                perf_text, t_class = "火眼金睛", "level-3"
+            elif h.correct_count >= 5:
+                perf_text, t_class = "渐入佳境", "level-2"
+            else:
+                perf_text, t_class = "再接再厉", "level-1"
 
         # 通过 created_at 匹配当时产生的错题记录
         wrong_list_formatted = []
@@ -1709,6 +1787,8 @@ async def get_challenge_history(user_id: int, db: Session = Depends(get_db)):
             "id": str(h.id),
             "score": h.score,
             "correctCount": h.correct_count,
+            "totalCount": total_count,
+            "mode": mode,
             "title": perf_text,
             "titleClass": t_class,
             "date": h.created_at.strftime("%Y-%m-%d %H:%M") if h.created_at else "",
@@ -1886,12 +1966,15 @@ async def delete_challenge_history(item_id: int, db: Session = Depends(get_db)):
 # --- 反馈历史 删除接口 ---
 @app.delete("/api/user/feedback_history/clear")
 async def clear_feedback_history(user_id: int, db: Session = Depends(get_db)):
+    # 只清理 status != 0（已采纳或已驳回）的记录，保护待处理记录！
     db.query(models.Feedback).filter(
         models.Feedback.user_id == user_id,
-        models.Feedback.is_deleted == False
+        models.Feedback.is_deleted == False,
+        models.Feedback.status != 0  # 新增的保护条件
     ).update({"is_deleted": True})
+
     db.commit()
-    return {"code": 200, "message": "清空成功"}
+    return {"code": 200, "message": "已清空办结记录"}
 
 
 @app.delete("/api/user/feedback_history/{item_id}")
@@ -2072,3 +2155,14 @@ async def redeem_mall_item(req: RedeemSchema, db: Session = Depends(get_db)):
         db.rollback()
         print("兑换发生异常：", e)
         return {"code": 500, "message": "服务器开小差了，请稍后重试"}
+
+
+# --- 商城兑换记录 删除接口 ---
+@app.delete("/api/user/redemption_history/{item_id}")
+async def delete_redemption_history(item_id: int, db: Session = Depends(get_db)):
+    # 直接物理删除该记录，释放数据库空间
+    # (不会影响用户余额，因为发币/扣币的流水在 PointRecord 表中安全保留)
+    db.query(models.RedemptionRecord).filter(models.RedemptionRecord.id == item_id).delete(synchronize_session=False)
+    db.commit()
+
+    return {"code": 200, "message": "删除成功"}

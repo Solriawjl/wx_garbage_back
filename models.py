@@ -75,7 +75,8 @@ class ChallengeHistory(Base):
     correct_count = Column(Integer, nullable=False, comment="答对题数")
     created_at = Column(DateTime, server_default=func.now(), comment="答题时间")
     is_deleted = Column(Boolean, default=False, comment="逻辑删除状态: False-可见, True-用户已删除")
-
+    mode = Column(String(50), default="classic")  # 'classic' 经典模式 / 'timed' 计时模式
+    total_count = Column(Integer, default=10)  # 该局总共做了多少题
     user = relationship("User", back_populates="challenge_histories")
 
 
