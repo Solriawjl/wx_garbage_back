@@ -1117,6 +1117,11 @@ def check_and_award_daily_task(user_id: int, task_type: int, reward_amount: int,
     通用防刷奖励机制
     :return: 实际获得的积分（若今天已完成则返回 0）
     """
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+
+    # 如果是老师，直接阻断积分发放源头
+    if not user or user.role == "teacher":
+        return 0
     today = date.today()
 
     # 1. 查询流水表，检查今天是否已完成该类型任务
@@ -1701,9 +1706,9 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
 
         calculated_score = base_score + bonus
 
-        # ==========================================
-        # 更新用户总星数和童趣版环保称号 (降低门槛)
-        # ==========================================
+    # ==========================================
+    # 更新用户总星数和童趣版环保称号 (降低门槛)
+    # ==========================================
     user.total_score += calculated_score
 
     new_title = user.title
@@ -1733,13 +1738,41 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
             user_id=user.id,
             item_name=wrong_item.item_name,
             user_answer=wrong_item.user_answer,
-            correct_answer=wrong_item.correct_answer
+            correct_answer=wrong_item.correct_answer,
+            status=0 # 默认未掌握
         )
         db.add(new_wrong)
 
+    # ==========================================
+    # 更新用户四大分类的雷达图学情库
+    # ==========================================
+    if hasattr(quiz_data, 'category_stats') and quiz_data.category_stats:
+        for stat in quiz_data.category_stats:
+            # 只有当这次挑战中确实遇到了该类别的题目时，才更新数据库
+            if stat.total > 0:
+                # 查询该用户该分类的统计记录是否已存在
+                stat_record = db.query(models.UserCategoryStat).filter(
+                    models.UserCategoryStat.user_id == user.id,
+                    models.UserCategoryStat.category_type == stat.category_type
+                ).first()
+
+                if stat_record:
+                    # 老记录：直接累加（这非常快）
+                    stat_record.total_answered += stat.total
+                    stat_record.correct_answered += stat.correct
+                else:
+                    # 新记录：如果小朋友是第一次做这类题，创建新行
+                    new_stat = models.UserCategoryStat(
+                        user_id=user.id,
+                        category_type=stat.category_type,
+                        total_answered=stat.total,
+                        correct_answered=stat.correct
+                    )
+                    db.add(new_stat)
+
     db.commit()
 
-    # 每日首次挑战奖励 (奖励 20 环保币)
+    # 每日首次挑战奖励 (奖励 2 小红花)
     reward_eco_coin = check_and_award_daily_task(
         user_id=user.id, task_type=3, reward_amount=2,
         description="每日首次挑战打卡奖励", db=db
@@ -2099,8 +2132,10 @@ async def delete_feedback_history(item_id: int, db: Session = Depends(get_db)):
 # 排行榜接口
 @app.get("/api/leaderboard")
 def get_leaderboard(db: Session = Depends(get_db)):
-    # 查询积分最高的前 10 名用户，按 total_score 降序排列
-    top_users = db.query(models.User).order_by(models.User.total_score.desc()).limit(10).all()
+    # 👇 核心修复：加上 role == 'student' 过滤，严防老师霸榜
+    top_users = db.query(models.User).filter(
+        models.User.role == "student"
+    ).order_by(models.User.total_score.desc()).limit(10).all()
 
     result = []
     for index, user in enumerate(top_users):
@@ -2302,3 +2337,409 @@ def generate_invite_code(db: Session = Depends(get_db)):
     db.commit()
 
     return {"code": 200, "message": "生成成功", "data": {"code": new_code_str}}
+
+
+# ==========================================
+# 接口：获取个人环保成长报告 (家长/学生学情看板)
+# ==========================================
+@app.get("/api/user/growth_report/{user_id}")
+async def get_growth_report(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        return {"code": 404, "message": "用户不存在"}
+
+    # ---------------------------------------------------------
+    # 维度一：基础信息与击败率 (Beat Percentage)
+    # ---------------------------------------------------------
+    # 只统计身份为 student 的总人数
+    total_users = db.query(models.User).filter(models.User.role == "student").count()
+
+    # 只在学生群体中，找出得分比当前用户低的人数
+    lower_score_users = db.query(models.User).filter(
+        models.User.role == "student",
+        models.User.total_score < user.total_score
+    ).count()
+
+    beat_percentage = 0
+    if total_users > 1:
+        beat_percentage = int((lower_score_users / (total_users - 1)) * 100)
+    elif total_users == 1:
+        beat_percentage = 100  # 全服唯一玩家就是 100%
+
+    # ---------------------------------------------------------
+    # 维度二：雷达图数据 (Radar Data) & 寻找薄弱项
+    # ---------------------------------------------------------
+    category_map = {1: "可回收物", 2: "有害垃圾", 3: "厨余垃圾", 4: "其他垃圾"}
+    stats = db.query(models.UserCategoryStat).filter(models.UserCategoryStat.user_id == user_id).all()
+
+    radar_data = []
+    highest_category = {"name": "综合", "acc": 0.0}
+    lowest_category = {"name": "无", "acc": 1.0}
+
+    # 确保 4 个分类都有默认数据，防止前端画图报错
+    stat_dict = {s.category_type: s for s in stats}
+    for c_id, c_name in category_map.items():
+        if c_id in stat_dict and stat_dict[c_id].total_answered > 0:
+            s = stat_dict[c_id]
+            acc = round(s.correct_answered / s.total_answered, 2)
+        else:
+            acc = 0.0  # 没答过默认为 0
+
+        radar_data.append({
+            "category_id": c_id,
+            "name": c_name,
+            "accuracy": acc
+        })
+
+        # 记录最高和最低（用于 AI 评语），且前提是该类至少答过题
+        if c_id in stat_dict and stat_dict[c_id].total_answered > 0:
+            if acc > highest_category["acc"]:
+                highest_category = {"name": c_name, "acc": acc}
+            if acc < lowest_category["acc"]:
+                lowest_category = {"name": c_name, "acc": acc}
+
+    # ---------------------------------------------------------
+    # 维度三：近 7 天活跃走势 (Activity Trend)
+    # ---------------------------------------------------------
+    today = datetime.now().date()
+    dates_list = [(today - timedelta(days=i)) for i in range(6, -1, -1)]
+    dates_str = [d.strftime("%m-%d") for d in dates_list]
+    counts_dict = {d: 0 for d in dates_str}
+
+    # 拉取近 7 天的答题记录
+    start_date = today - timedelta(days=6)
+    history_records = db.query(models.ChallengeHistory.created_at).filter(
+        models.ChallengeHistory.user_id == user_id,
+        models.ChallengeHistory.created_at >= start_date
+    ).all()
+
+    # Python 内存聚合按天统计（完美避开不同数据库的 Date 兼容问题）
+    for record in history_records:
+        record_date_str = record[0].strftime("%m-%d")
+        if record_date_str in counts_dict:
+            counts_dict[record_date_str] += 1
+
+    activity_counts = [counts_dict[d] for d in dates_str]
+
+    # ---------------------------------------------------------
+    # 维度四：学习偏好 (Learning Habit) - 实践探索 vs 理论刷题
+    # ---------------------------------------------------------
+    # 统计拍照识别次数
+    recognize_count = db.query(models.RecognizeHistory).filter(models.RecognizeHistory.user_id == user_id).count()
+    # 统计挑战答题次数
+    quiz_count = db.query(models.ChallengeHistory).filter(models.ChallengeHistory.user_id == user_id).count()
+
+    preference_tag = "全能环保卫士"
+    if recognize_count > quiz_count * 1.5 and recognize_count >= 5:
+        preference_tag = "实践探索家"
+    elif quiz_count > recognize_count * 1.5 and quiz_count >= 5:
+        preference_tag = "理论小考神"
+    elif recognize_count == 0 and quiz_count == 0:
+        preference_tag = "环保小萌新"
+
+    # ---------------------------------------------------------
+    # 维度五：错题消化率 (Mistake Clearance)
+    # ---------------------------------------------------------
+    total_wrong = db.query(models.WrongBook).filter(models.WrongBook.user_id == user_id).count()
+    cleared_count = db.query(models.WrongBook).filter(models.WrongBook.user_id == user_id,
+                                                      models.WrongBook.status == 1).count()
+
+    clear_rate = 0.0
+    if total_wrong > 0:
+        clear_rate = round(cleared_count / total_wrong, 2)
+
+    # ---------------------------------------------------------
+    # 维度六：AI 智能教育评语引擎
+    # ---------------------------------------------------------
+    if total_wrong == 0 and quiz_count > 0:
+        ai_comment = "太不可思议了！你的正确率高得惊人，没有任何错题，是完美的学霸！"
+    elif sum(activity_counts) == 0:
+        ai_comment = "最近几天都没有看到你的身影哦，环保习惯需要每天坚持，快来挑战一下吧！"
+    elif highest_category["name"] == "综合" and lowest_category["name"] == "无":
+        ai_comment = "你还没有积攒足够的答题数据哦，快去【答题闯关】或者【拍照识别】丰富你的档案吧！"
+    else:
+        # 基于偏科数据的点评
+        ai_comment = f"宝贝是【{highest_category['name']}】小达人！"
+        if lowest_category["name"] != highest_category["name"] and lowest_category["acc"] < 0.6:
+            ai_comment += f"但在分辨【{lowest_category['name']}】时容易掉进陷阱，属于偏科型选手，建议多复习一下错题本哦！"
+        elif clear_rate > 0.8:
+            ai_comment += "而且你的错题消化率极高，这种不畏困难的学习态度值得表扬！"
+        else:
+            ai_comment += "继续保持现在的热情，多去现实里扫一扫垃圾巩固知识吧！"
+
+    # ---------------------------------------------------------
+    # 组装返回最终的 JSON 契约
+    # ---------------------------------------------------------
+    return {
+        "code": 200,
+        "message": "获取成长报告成功",
+        "data": {
+            "basic_info": {
+                "total_stars": user.total_score,
+                "current_title": user.title,
+                "beat_percentage": beat_percentage
+            },
+            "radar_data": radar_data,
+            "activity_7_days": {
+                "dates": dates_str,
+                "counts": activity_counts
+            },
+            "learning_habit": {
+                "recognize_count": recognize_count,
+                "quiz_count": quiz_count,
+                "preference_tag": preference_tag
+            },
+            "mistake_clearance": {
+                "cleared_count": cleared_count,
+                "total_wrong": total_wrong,
+                "clear_rate": clear_rate
+            },
+            "ai_comment": ai_comment
+        }
+    }
+
+
+# ==========================================
+# 指导老师端专属 API 模块
+# ==========================================
+
+# --- 1. 班级学情大盘 (排行榜与高频错题) ---
+@app.get("/api/teacher/dashboard")
+async def get_teacher_dashboard(db: Session = Depends(get_db)):
+    # ---------------------------------------------------------
+    # 1. 光荣榜 (Top 10 学生) - 已加防火墙
+    # ---------------------------------------------------------
+    top_students = db.query(models.User).filter(
+        models.User.role == "student"
+    ).order_by(desc(models.User.total_score)).limit(10).all()
+
+    leaderboard = [{
+        "id": u.id,
+        "nickname": u.nickname,
+        "avatar": u.avatar_url,
+        "score": u.total_score,
+        "title": u.title
+    } for u in top_students]
+
+    # ---------------------------------------------------------
+    # 2. 高频错题 Top 5 - 已加防火墙
+    # ---------------------------------------------------------
+    top_mistakes = db.query(
+        models.WrongBook.item_name,
+        models.WrongBook.correct_answer,
+        func.count(models.WrongBook.id).label('err_count')
+    ).join(models.User, models.WrongBook.user_id == models.User.id) \
+        .filter(models.User.role == "student") \
+        .group_by(models.WrongBook.item_name, models.WrongBook.correct_answer) \
+        .order_by(desc('err_count')).limit(5).all()
+
+    mistakes_list = [{
+        "item_name": m.item_name,
+        "correct_answer": m.correct_answer,
+        "error_count": m.err_count
+    } for m in top_mistakes]
+
+    # ---------------------------------------------------------
+    # 3. [新增] 班级综合能力雷达图 (全班平均正确率)
+    # ---------------------------------------------------------
+    # SQL 逻辑：查询全班所有人在各个类别的答题总数和答对总数，求和
+    radar_stats = db.query(
+        models.UserCategoryStat.category_type,
+        func.sum(models.UserCategoryStat.total_answered).label('total_sum'),
+        func.sum(models.UserCategoryStat.correct_answered).label('correct_sum')
+    ).join(models.User, models.UserCategoryStat.user_id == models.User.id) \
+        .filter(models.User.role == "student") \
+        .group_by(models.UserCategoryStat.category_type).all()
+
+    category_map = {1: "可回收物", 2: "有害垃圾", 3: "厨余垃圾", 4: "其他垃圾"}
+    class_radar = []
+
+    # 转换查询结果为字典方便读取
+    stat_dict = {s.category_type: s for s in radar_stats}
+
+    for c_id, c_name in category_map.items():
+        acc = 0.0
+        if c_id in stat_dict and stat_dict[c_id].total_sum and stat_dict[c_id].total_sum > 0:
+            acc = round(stat_dict[c_id].correct_sum / stat_dict[c_id].total_sum, 2)
+
+        class_radar.append({
+            "category_id": c_id,
+            "name": c_name,
+            "accuracy": acc
+        })
+
+    # ---------------------------------------------------------
+    # 4. [新增] 近 7 天班级学习活跃走势
+    # ---------------------------------------------------------
+    today = datetime.now().date()
+    dates_list = [(today - timedelta(days=i)) for i in range(6, -1, -1)]
+    dates_str = [d.strftime("%m-%d") for d in dates_list]
+    counts_dict = {d: 0 for d in dates_str}
+
+    start_date = today - timedelta(days=6)
+
+    # 拉取全班学生的挑战(答题)记录
+    challenge_records = db.query(models.ChallengeHistory.created_at).join(
+        models.User, models.ChallengeHistory.user_id == models.User.id
+    ).filter(
+        models.User.role == "student",
+        models.ChallengeHistory.created_at >= start_date
+    ).all()
+
+    # 拉取全班学生的拍照记录
+    recognize_records = db.query(models.RecognizeHistory.created_at).join(
+        models.User, models.RecognizeHistory.user_id == models.User.id
+    ).filter(
+        models.User.role == "student",
+        models.RecognizeHistory.created_at >= start_date
+    ).all()
+
+    # 在内存中合并计算每天的总人次
+    all_records = challenge_records + recognize_records
+    for record in all_records:
+        record_date_str = record[0].strftime("%m-%d")
+        if record_date_str in counts_dict:
+            counts_dict[record_date_str] += 1
+
+    class_activity = {
+        "dates": dates_str,
+        "counts": [counts_dict[d] for d in dates_str]
+    }
+
+    # ---------------------------------------------------------
+    # 组装返回数据
+    # ---------------------------------------------------------
+    return {
+        "code": 200,
+        "message": "获取大盘数据成功",
+        "data": {
+            "leaderboard": leaderboard,
+            "top_mistakes": mistakes_list,
+            "class_radar": class_radar,  # 👈 新增给 ECharts 雷达图的数据
+            "class_activity": class_activity  # 👈 新增给 ECharts 折线图的数据
+        }
+    }
+
+
+# --- 2. 获取待核销(待发奖)的订单列表 ---
+@app.get("/api/teacher/pending_orders")
+async def get_pending_orders(db: Session = Depends(get_db)):
+    # 查询所有 status == 0 (待发放) 的兑换记录
+    # 按时间正序排列（先申请的先处理）
+    orders = db.query(models.RedemptionRecord).filter(models.RedemptionRecord.status == 0).order_by(
+        models.RedemptionRecord.created_at.asc()).all()
+
+    res_list = []
+    for order in orders:
+        student = db.query(models.User).filter(models.User.id == order.user_id).first()
+        item = db.query(models.MallItem).filter(models.MallItem.id == order.item_id).first()
+
+        if student and item:
+            res_list.append({
+                "order_id": order.id,
+                "student_id": student.id,
+                "student_name": student.nickname,
+                "student_avatar": student.avatar_url,
+                "item_name": item.name,
+                "item_image": item.image_url,
+                "cost": order.points_cost,
+                "created_at": order.created_at.strftime("%m-%d %H:%M")
+            })
+
+    return {"code": 200, "message": "获取待核销列表成功", "data": res_list}
+
+
+# --- 3. 老师执行核销动作 (发奖) ---
+from pydantic import BaseModel
+
+
+class VerifyOrderReq(BaseModel):
+    order_id: int
+    teacher_id: int
+
+
+@app.post("/api/teacher/verify")
+async def verify_student_order(req: VerifyOrderReq, db: Session = Depends(get_db)):
+    order = db.query(models.RedemptionRecord).filter(models.RedemptionRecord.id == req.order_id).first()
+
+    if not order:
+        return {"code": 404, "message": "找不到该订单"}
+    if order.status == 1:
+        return {"code": 400, "message": "该奖品已经被核销过了，请勿重复操作"}
+
+    # 确认核销：更新状态，并打上当前操作老师的思想钢印和时间戳
+    order.status = 1
+    order.verified_by = req.teacher_id
+    order.verified_at = datetime.now()
+
+    db.commit()
+
+    return {"code": 200, "message": "🎉 核销成功！奖品已发放"}
+
+
+# ==========================================
+# 通用图片上传接口 (复用腾讯云 COS)
+# ==========================================
+@app.post("/api/upload")
+async def upload_common_image(file: UploadFile = File(...)):
+    try:
+        # 1. 读取文件二进制内容
+        file_content = await file.read()
+
+        # 2. 生成一个永不重复的文件名，并放在 mall_items 文件夹下
+        file_extension = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+        unique_filename = f"mall_items/{uuid.uuid4().hex}.{file_extension}"
+
+        # 3. 调用你之前封装好的 COS 上传函数
+        image_url = upload_file_to_cos(file_content, unique_filename)
+
+        if not image_url:
+            return {"code": 500, "message": "图片上传到云端失败"}
+
+        # 4. 完美返回给前端
+        return {
+            "code": 200,
+            "message": "上传成功",
+            "data": {"url": image_url}
+        }
+    except Exception as e:
+        return {"code": 500, "message": f"服务器异常: {str(e)}"}
+
+# --- 老师发布新奖品 ---
+@app.post("/api/teacher/mall/add")
+async def add_mall_item(item_data: schemas.MallItemCreate, db: Session = Depends(get_db)):
+    # 检查是否有权限
+    teacher = db.query(models.User).filter(models.User.id == item_data.teacher_id).first()
+    if not teacher or teacher.role != "teacher":
+        return {"code": 403, "message": "权限不足，只有老师可以发布奖品"}
+
+    new_item = models.MallItem(
+        name=item_data.name,
+        desc=item_data.desc,
+        points_price=item_data.points_price,
+        image_url=item_data.image_url,
+        stock=item_data.stock,
+        created_by=item_data.teacher_id
+    )
+    db.add(new_item)
+    db.commit()
+    return {"code": 200, "message": "奖品发布成功！"}
+
+
+# --- 老师管理奖品列表（包含下架功能） ---
+@app.get("/api/teacher/mall/list")
+async def get_teacher_mall_items(db: Session = Depends(get_db)):
+    # 老师可以看到所有奖品，并进行管理
+    items = db.query(models.MallItem).order_by(models.MallItem.created_at.desc()).all()
+    return {"code": 200, "data": items}
+
+
+# --- 切换奖品状态（上架/下架） ---
+@app.post("/api/teacher/mall/toggle/{item_id}")
+async def toggle_mall_item(item_id: int, db: Session = Depends(get_db)):
+    item = db.query(models.MallItem).filter(models.MallItem.id == item_id).first()
+    if not item: return {"code": 404, "message": "商品不存在"}
+
+    item.is_active = not item.is_active
+    db.commit()
+    return {"code": 200, "message": "操作成功", "new_status": item.is_active}

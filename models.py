@@ -100,6 +100,7 @@ class WrongBook(Base):
     item_name = Column(String(100), nullable=False, comment="做错的题目")
     user_answer = Column(String(50), nullable=False, comment="用户的错误选项")
     correct_answer = Column(String(50), nullable=False, comment="正确答案")
+    status = Column(Integer, default=0, comment="0-待复习(未掌握), 1-已消灭(已掌握)")
     created_at = Column(DateTime, server_default=func.now(), comment="做错时间")
     is_deleted = Column(Boolean, default=False, comment="逻辑删除状态: False-可见, True-用户已删除")
 
@@ -221,8 +222,9 @@ class MallItem(Base):
     stock = Column(Integer, default=-1, comment="库存数量")
 
     is_active = Column(Boolean, default=True, comment="是否上架")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True, comment="发布者ID")
     created_at = Column(DateTime, server_default=func.now())
-
+    creator = relationship("User")
 
 class RedemptionRecord(Base):
     """
@@ -238,6 +240,28 @@ class RedemptionRecord(Base):
 
     # 状态：0-待核销(未发货), 1-已核销(已完成)
     status = Column(Integer, default=0, comment="核销状态")
-
+    verified_by = Column(Integer, ForeignKey("users.id"), nullable=True, comment="核销老师的ID")
+    verified_at = Column(DateTime, nullable=True, comment="核销时间")
     created_at = Column(DateTime, server_default=func.now())
 
+
+# --- 11. 用户学情雷达统计表 (新增) ---
+class UserCategoryStat(Base):
+    """
+    记录用户在四大分类上的答题正确率，用于绘制雷达图
+    """
+    __tablename__ = "user_category_stats"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+    # 类别：1-可回收, 2-有害, 3-厨余, 4-其他
+    category_type = Column(Integer, nullable=False, index=True)
+
+    # 统计数据
+    total_answered = Column(Integer, default=0, comment="该类别总共答了多少次")
+    correct_answered = Column(Integer, default=0, comment="该类别答对了多少次")
+
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    user = relationship("User")
