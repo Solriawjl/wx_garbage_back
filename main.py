@@ -251,16 +251,48 @@ async def get_admin_menu():
             {
                 "path": "/users",
                 "name": "userManage",
-                "component": "/users/index",
+                # 含有子菜单的父级组件通常必须是 "Layout"
+                "component": "Layout",
                 "meta": {
                     "icon": "User",
-                    "title": "小程序用户管理", # 用户信息
+                    "title": "小程序用户管理",
                     "isLink": "",
                     "isHide": False,
                     "isFull": False,
                     "isAffix": False,
                     "isKeepAlive": True
-                }
+                },
+                # 嵌套的二级菜单列表
+                "children": [
+                    {
+                        "path": "/users/student/index",
+                        "name": "studentManage",
+                        "component": "/users/student/index",  # 指向我们刚才新建的小卫士页面
+                        "meta": {
+                            "icon": "Avatar",  # 小卫士的图标
+                            "title": "环保小卫士",
+                            "isLink": "",
+                            "isHide": False,
+                            "isFull": False,
+                            "isAffix": False,
+                            "isKeepAlive": True
+                        }
+                    },
+                    {
+                        "path": "/users/teacher/index",
+                        "name": "teacherManage",
+                        "component": "/users/teacher/index",  # 指向我们刚才新建的老师页面
+                        "meta": {
+                            "icon": "Briefcase",  # 老师的图标
+                            "title": "指导老师",
+                            "isLink": "",
+                            "isHide": False,
+                            "isFull": False,
+                            "isAffix": False,
+                            "isKeepAlive": True
+                        }
+                    }
+                ]
             },
             {
                 "path": "/mall",
@@ -558,11 +590,11 @@ async def audit_admin_feedback(req: AuditFeedbackSchema, db: Session = Depends(g
     if req.status == 1 and original_status != 1:
         user = db.query(models.User).filter(models.User.id == feedback.user_id).first()
         if user:
-            user.eco_coin += 5  # 增加 5 个环保币
+            user.eco_coin += 2  # 增加 2 朵小红花
 
             new_record = models.PointRecord(
                 user_id=user.id,
-                change_amount=5,
+                change_amount=2,
                 task_type=6,  # 约定 6 代表纠错奖励
                 description=f"纠错被采纳奖励：{feedback.item_name}"
             )
@@ -572,11 +604,11 @@ async def audit_admin_feedback(req: AuditFeedbackSchema, db: Session = Depends(g
     elif req.status == 2 and original_status == 1:
         user = db.query(models.User).filter(models.User.id == feedback.user_id).first()
         if user:
-            user.eco_coin -= 5  # 追回 5 个环保币
+            user.eco_coin -= 2  # 追回 2 朵小红花
 
             new_record = models.PointRecord(
                 user_id=user.id,
-                change_amount=-5,
+                change_amount=-2,
                 task_type=6,
                 description=f"纠错重新驳回，扣除奖励：{feedback.item_name}"
             )
@@ -594,6 +626,7 @@ async def get_admin_users(
     pageNum: int = Query(1, description="当前页码"),
     pageSize: int = Query(10, description="每页数量"),
     nickname: str = Query(None, description="搜索：用户昵称"),
+    role: str = Query(None, description="搜索：用户角色"),  # 接收前端传来的角色搜索词
     db: Session = Depends(get_db)
 ):
     """
@@ -604,6 +637,10 @@ async def get_admin_users(
     # 支持按昵称模糊搜索
     if nickname:
         query = query.filter(models.User.nickname.like(f"%{nickname}%"))
+
+    # 支持按角色精准筛选
+    if role:
+        query = query.filter(models.User.role == role)
 
     total = query.count()
     skip = (pageNum - 1) * pageSize
@@ -616,6 +653,7 @@ async def get_admin_users(
             "openid": u.openid,  # 微信唯一标识
             "nickname": u.nickname or "微信用户",
             "avatar_url": u.avatar_url or "",
+            "role": u.role,
             "score": u.total_score ,  # 积分段位
             "eco_coin": u.eco_coin,
             "title": u.title if hasattr(u, 'title') and u.title else "环保新手",
@@ -956,14 +994,25 @@ async def refund_mall_item(req: RefundSchema, db: Session = Depends(get_db)):
 def read_root():
     return {"message": "垃圾分类后端服务已成功启动！"}
 
+
+# 定义注册请求接收的数据格式
+class WxRegisterRequest(BaseModel):
+    openid: str
+    role: str = "student"
+    invite_code: Optional[str] = None  # 选填，但如果是 teacher 则必填
+    nickname: str = "微信用户"
+    avatar_url: str = ""
+
+
 # ==========================================
-# 接口：微信静默登录 / 自动注册
+# 接口：微信静默登录
 # ==========================================
-@app.post("/api/user/login", response_model=schemas.UserResponse)
+@app.post("/api/user/login")
 def wechat_login(request_data: schemas.WxLoginRequest, db: Session = Depends(get_db)):
     """
-    接收前端传来的 code，向微信服务器换取 openid，
-    并在数据库中进行查找或自动注册。
+    静默登录：只换取 OpenID 并查库。
+    如果有：返回 200 和角色信息直接进首页。
+    如果没有：返回 404 和 OpenID，让前端拦截去注册页。
     """
     url = f"https://api.weixin.qq.com/sns/jscode2session?appid={WX_APPID}&secret={WX_SECRET}&js_code={request_data.code}&grant_type=authorization_code"
 
@@ -971,25 +1020,94 @@ def wechat_login(request_data: schemas.WxLoginRequest, db: Session = Depends(get
     res_data = response.json()
 
     if "errcode" in res_data and res_data["errcode"] != 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"微信授权失败，错误码：{res_data['errcode']}, 信息：{res_data.get('errmsg')}"
-        )
+        return {"code": 400, "message": f"微信授权失败: {res_data.get('errmsg')}", "data": None}
 
     openid = res_data.get("openid")
     if not openid:
-        raise HTTPException(status_code=400, detail="未获取到有效 OpenID")
+        return {"code": 400, "message": "未获取到有效 OpenID", "data": None}
 
+    # 查库看是否已经是老用户
     user = db.query(models.User).filter(models.User.openid == openid).first()
 
-    if not user:
-        user = models.User(openid=openid)
-        db.add(user)
+    if user:
+        # 老用户，静默登录成功
+        return {
+            "code": 200,
+            "message": "静默登录成功",
+            "data": {
+                "id": user.id,
+                "openid": user.openid,
+                "role": user.role,  # 前端将根据这个 role 决定进入学生版还是教师版
+                "nickname": user.nickname,
+                "avatar_url": user.avatar_url
+            }
+        }
+    else:
+        # 新用户，不再自动落库！返回 404 让前端去注册页
+        return {
+            "code": 404,
+            "message": "新用户未注册，请前往身份选择页",
+            "data": {
+                "openid": openid  # 把 openid 吐给前端，前端在下一步注册时要传回来
+            }
+        }
+
+
+# ==========================================
+# 接口：新用户角色注册
+# ==========================================
+@app.post("/api/user/register")
+def wechat_register(req: WxRegisterRequest, db: Session = Depends(get_db)):
+    """
+    前端选择身份后，调用此接口真正完成注册落库。
+    包含教师邀请码的安全拦截逻辑。
+    """
+    # 1. 防止重复注册
+    exist_user = db.query(models.User).filter(models.User.openid == req.openid).first()
+    if exist_user:
+        return {"code": 400, "message": "该微信账号已注册，请直接登录"}
+
+    # 2. 如果选择老师角色，必须校验邀请码
+    invite_record = None
+    if req.role == "teacher":
+        if not req.invite_code:
+            return {"code": 400, "message": "注册老师账号需要提供专属邀请码哦"}
+
+        # 查邀请码表
+        invite_record = db.query(models.TeacherInviteCode).filter(
+            models.TeacherInviteCode.code == req.invite_code).first()
+
+        if not invite_record:
+            return {"code": 400, "message": "邀请码无效，请联系管理员获取"}
+        if invite_record.is_used:
+            return {"code": 400, "message": "该邀请码已经被其他老师使用过了"}
+
+    # 3. 校验通过，创建新用户
+    new_user = models.User(
+        openid=req.openid,
+        role=req.role,
+        nickname=req.nickname,
+        avatar_url=req.avatar_url
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    # 4. 如果是老师，立即将该邀请码核销并绑定使用者
+    if req.role == "teacher" and invite_record:
+        invite_record.is_used = True
+        invite_record.used_by = new_user.id
         db.commit()
-        db.refresh(user)
 
-    return user
-
+    return {
+        "code": 200,
+        "message": "注册成功！欢迎加入",
+        "data": {
+            "id": new_user.id,
+            "role": new_user.role,
+            "nickname": new_user.nickname
+        }
+    }
 
 # ==========================================
 # 处理每日任务积分奖励与防刷校验
@@ -1131,7 +1249,7 @@ async def recognize_garbage(
     reward_points = check_and_award_daily_task(
         user_id=user_id,
         task_type=1,
-        reward_amount=10,
+        reward_amount=1,
         description="每日首次拍照打卡奖励",
         db=db
     )
@@ -1225,7 +1343,7 @@ async def recognize_garbage_edge(
     reward_points = check_and_award_daily_task(
         user_id=user_id,
         task_type=1,
-        reward_amount=10,
+        reward_amount=1,
         description="每日首次拍照打卡奖励",
         db=db
     )
@@ -1485,7 +1603,7 @@ async def finish_read_task(req: ReadTaskSchema, db: Session = Depends(get_db)):
     reward_points = check_and_award_daily_task(
         user_id=req.user_id,
         task_type=2,
-        reward_amount=15,
+        reward_amount=1,
         description="每日科普阅读打卡奖励",
         db=db
     )
@@ -1548,40 +1666,33 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
     current_performance = "再接再厉"
 
     if quiz_data.mode == "timed":
-        # 【计时模式】基础分 15
-        base_score = 15
+        # 【计时模式】基础星 1
+        base_score = 1
         bonus = 0
         time_ratio = quiz_data.time_used / quiz_data.total_time if quiz_data.total_time > 0 else 1.0
 
-        # 规则 1：全对 且 用时 <= 60%
         if accuracy == 1.0 and time_ratio <= 0.6:
-            bonus = 30
-            current_performance = "极限王者"  # 稀有表现
-        # 规则 2：正确率 >= 80% 且 未超时
+            bonus = 2  # 全对且极快，额外拿2星
+            current_performance = "闪电小超人"
         elif accuracy >= 0.8 and quiz_data.time_used <= quiz_data.total_time:
-            bonus = 15
-            current_performance = "极速达人"
-        # 规则 3：及格线或超时
+            bonus = 1
+            current_performance = "极速小达人"
         elif accuracy >= 0.5:
-            bonus = 5
             current_performance = "游刃有余"
         else:
-            current_performance = "眼疾手快"  # 参与安慰奖
+            current_performance = "再接再厉"
 
         calculated_score = base_score + bonus
 
     else:
-        # 【经典模式】基础分 10
-        base_score = 10
+        # 【经典模式】基础星 1
+        base_score = 1
         bonus = 0
 
-        # 规则 1：100% 全对
         if accuracy == 1.0:
-            bonus = 15
+            bonus = 1  # 全对额外拿1星
             current_performance = "完美通关"
-        # 规则 2：正确率 >= 80%
         elif accuracy >= 0.8:
-            bonus = 5
             current_performance = "火眼金睛"
         elif accuracy >= 0.5:
             current_performance = "渐入佳境"
@@ -1590,20 +1701,20 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
 
         calculated_score = base_score + bonus
 
-    # ==========================================
-
-    # 更新用户总分和环保称号
+        # ==========================================
+        # 更新用户总星数和童趣版环保称号 (降低门槛)
+        # ==========================================
     user.total_score += calculated_score
 
     new_title = user.title
-    if user.total_score >= 500:
-        new_title = "环保宗师"
-    elif user.total_score >= 200:
-        new_title = "环保达人"
-    elif user.total_score >= 50:
-        new_title = "环保卫士"
+    if user.total_score >= 50:
+        new_title = "环保小宗师"  # 原为 500
+    elif user.total_score >= 20:
+        new_title = "环保小达人"  # 原为 200
+    elif user.total_score >= 5:
+        new_title = "环保小卫士"  # 原为 50
     else:
-        new_title = "环保新手"
+        new_title = "环保小萌新"
     user.title = new_title
 
     # 存入历史记录
@@ -1630,7 +1741,7 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
 
     # 每日首次挑战奖励 (奖励 20 环保币)
     reward_eco_coin = check_and_award_daily_task(
-        user_id=user.id, task_type=3, reward_amount=20,
+        user_id=user.id, task_type=3, reward_amount=2,
         description="每日首次挑战打卡奖励", db=db
     )
 
@@ -2166,3 +2277,28 @@ async def delete_redemption_history(item_id: int, db: Session = Depends(get_db))
     db.commit()
 
     return {"code": 200, "message": "删除成功"}
+
+
+# 新增获取和生成邀请码的接口
+
+@app.get("/api/admin/invite_codes")
+def get_invite_codes(db: Session = Depends(get_db)):
+    """获取所有教师邀请码"""
+    codes = db.query(models.TeacherInviteCode).order_by(models.TeacherInviteCode.id.desc()).all()
+    return {"code": 200, "data": [{"id": c.id, "code": c.code, "is_used": c.is_used} for c in codes]}
+
+
+@app.post("/api/admin/generate_invite_code")
+def generate_invite_code(db: Session = Depends(get_db)):
+    """生成一个新的教师邀请码"""
+    import random
+    import string
+    # 生成如 TCH-A1B2C3 的随机码
+    random_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    new_code_str = f"TCH-{random_str}"
+
+    new_code = models.TeacherInviteCode(code=new_code_str)
+    db.add(new_code)
+    db.commit()
+
+    return {"code": 200, "message": "生成成功", "data": {"code": new_code_str}}

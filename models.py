@@ -21,6 +21,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True, comment="主键ID")
     openid = Column(String(100), unique=True, nullable=False, index=True, comment="微信用户唯一标识")
+    role = Column(String(20), default="student", comment="角色: student/teacher")
     nickname = Column(String(100), default="微信用户", comment="用户昵称")
     avatar_url = Column(String(255), nullable=True, comment="用户头像链接")
     total_score = Column(Integer, default=0, comment="答题总积分")
@@ -35,6 +36,16 @@ class User(Base):
     wrong_books = relationship("WrongBook", back_populates="user")
     feedbacks = relationship("Feedback", back_populates="user")
 
+
+# --- 教师邀请码表 ---
+class TeacherInviteCode(Base):
+    __tablename__ = "teacher_invite_codes"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    code = Column(String(20), unique=True, nullable=False, index=True, comment="邀请码")
+    is_used = Column(Boolean, default=False, comment="是否已被使用")
+    used_by = Column(Integer, ForeignKey("users.id"), nullable=True, comment="使用者ID")
+    created_at = Column(DateTime, server_default=func.now(), comment="生成时间")
 
 # --- 2. 垃圾分类字典表 ---
 class GarbageItem(Base):
