@@ -265,3 +265,21 @@ class UserCategoryStat(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     user = relationship("User")
+
+
+# --- 12. 环保知识阅读记录表 (新增) ---
+class ReadingRecord(Base):
+    """
+    记录用户点击查看环保知识的行为，用于统计活跃度和学习偏好
+    """
+    __tablename__ = "reading_records"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+    # 关联到你 SystemConfig 表里的某条知识 id
+    tip_id = Column(Integer, comment="阅读的知识条目ID")
+
+    created_at = Column(DateTime, server_default=func.now(), comment="阅读时间")
+
+    user = relationship("User")

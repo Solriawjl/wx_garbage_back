@@ -300,7 +300,7 @@ async def get_admin_menu():
                 "component": "/mall/index",
                 "meta": {
                     "icon": "Goods",
-                    "title": "积分商城管理",
+                    "title": "小红花商城管理",
                     "isLink": "",
                     "isHide": False,
                     "isFull": False,
@@ -1625,6 +1625,22 @@ async def finish_read_task(req: ReadTaskSchema, db: Session = Depends(get_db)):
             "title": user.title if user else "环保新手"
         }
     }
+
+# --- 记录阅读行为的接口 ---
+# 1. 定义一个用于接收前端 JSON Body 的数据模型
+class ReadingRecordCreate(BaseModel):
+    user_id: int
+    tip_id: int
+
+# 2. 修改接口，使用刚刚定义的模型来接收数据
+@app.post("/api/user/reading/record")
+async def add_reading_record(record: ReadingRecordCreate, db: Session = Depends(get_db)):
+    # 3. 从模型中提取数据并保存
+    new_record = models.ReadingRecord(user_id=record.user_id, tip_id=record.tip_id)
+    db.add(new_record)
+    db.commit()
+    return {"code": 200, "message": "阅读记录已保存"}
+
 # ==========================================
 # 接口：随机生成挑战题目
 # ==========================================
@@ -1945,6 +1961,7 @@ async def get_challenge_history(user_id: int, db: Session = Depends(get_db)):
 # 4. 获取我的错题本
 @app.get("/api/user/wrong_book")
 async def get_wrong_book(user_id: int, db: Session = Depends(get_db)):
+    # 1. 查出该用户所有未被删除的错题，按时间倒序
     histories = db.query(models.WrongBook).filter(
         models.WrongBook.user_id == user_id,
         models.WrongBook.is_deleted == False
@@ -1958,13 +1975,20 @@ async def get_wrong_book(user_id: int, db: Session = Depends(get_db)):
             unique_wrongs[w.item_name] = {
                 "id": str(w.id),
                 "name": w.item_name,
-                "userSelect": w.user_answer,  # 保留最新一次选错的答案
+                "userSelect": w.user_answer,
                 "correctAnswer": w.correct_answer,
-                "errorCount": 1  # 初始次数为 1
+                "errorCount": 1,
+
+                # 必须把这俩字段传给前端！否则前端无法判断状态和时间！
+                "status": w.status,
+                "created_at": w.created_at.isoformat() if w.created_at else None
             }
         else:
-            # 如果字典里已经有了，说明历史上也错过，只增加错误次数，其他信息保留最新的
+            # 如果字典里已经有了，说明历史上也错过，只增加错误次数
             unique_wrongs[w.item_name]["errorCount"] += 1
+
+            # 💡 细节优化：即使多次做错，如果最新的这一次状态是“已消灭(1)”，也应该保留
+            # （因为历史是倒序遍历的，第一次遇到的就是最新的）
 
     # 3. 将字典的值转化为列表返回给前端
     result = list(unique_wrongs.values())
@@ -2342,6 +2366,29 @@ def generate_invite_code(db: Session = Depends(get_db)):
 # ==========================================
 # 接口：获取个人环保成长报告 (家长/学生学情看板)
 # ==========================================
+# --- 将错题标记为“已消灭(已掌握)” ---
+@app.post("/api/user/wrong_book/resolve/{wrong_id}")
+async def resolve_wrong_question(wrong_id: int, db: Session = Depends(get_db)):
+    # 1. 查找对应的错题记录，且确保它没被逻辑删除
+    wrong_item = db.query(models.WrongBook).filter(
+        models.WrongBook.id == wrong_id,
+        models.WrongBook.is_deleted == False
+    ).first()
+
+    if not wrong_item:
+        return {"code": 404, "message": "未找到该错题记录"}
+
+    # 2. 将状态更新为 1 (已掌握)
+    wrong_item.status = 1
+    db.commit()
+
+    return {
+        "code": 200,
+        "message": "太棒了，这道题你已经掌握啦！",
+        "data": {"id": wrong_id, "status": 1}
+    }
+
+
 @app.get("/api/user/growth_report/{user_id}")
 async def get_growth_report(user_id: int, db: Session = Depends(get_db)):
     user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -2351,10 +2398,8 @@ async def get_growth_report(user_id: int, db: Session = Depends(get_db)):
     # ---------------------------------------------------------
     # 维度一：基础信息与击败率 (Beat Percentage)
     # ---------------------------------------------------------
-    # 只统计身份为 student 的总人数
+    # 过滤掉 teacher，仅在 student 群体中计算击败率，防止数据干扰
     total_users = db.query(models.User).filter(models.User.role == "student").count()
-
-    # 只在学生群体中，找出得分比当前用户低的人数
     lower_score_users = db.query(models.User).filter(
         models.User.role == "student",
         models.User.total_score < user.total_score
@@ -2364,7 +2409,7 @@ async def get_growth_report(user_id: int, db: Session = Depends(get_db)):
     if total_users > 1:
         beat_percentage = int((lower_score_users / (total_users - 1)) * 100)
     elif total_users == 1:
-        beat_percentage = 100  # 全服唯一玩家就是 100%
+        beat_percentage = 100
 
     # ---------------------------------------------------------
     # 维度二：雷达图数据 (Radar Data) & 寻找薄弱项
@@ -2376,22 +2421,21 @@ async def get_growth_report(user_id: int, db: Session = Depends(get_db)):
     highest_category = {"name": "综合", "acc": 0.0}
     lowest_category = {"name": "无", "acc": 1.0}
 
-    # 确保 4 个分类都有默认数据，防止前端画图报错
     stat_dict = {s.category_type: s for s in stats}
     for c_id, c_name in category_map.items():
         if c_id in stat_dict and stat_dict[c_id].total_answered > 0:
             s = stat_dict[c_id]
             acc = round(s.correct_answered / s.total_answered, 2)
         else:
-            acc = 0.0  # 没答过默认为 0
+            acc = 0.0
 
         radar_data.append({
             "category_id": c_id,
             "name": c_name,
+            "value": int(acc * 100),  # 新增：供前端直接显示的整数数值
             "accuracy": acc
         })
 
-        # 记录最高和最低（用于 AI 评语），且前提是该类至少答过题
         if c_id in stat_dict and stat_dict[c_id].total_answered > 0:
             if acc > highest_category["acc"]:
                 highest_category = {"name": c_name, "acc": acc}
@@ -2399,66 +2443,95 @@ async def get_growth_report(user_id: int, db: Session = Depends(get_db)):
                 lowest_category = {"name": c_name, "acc": acc}
 
     # ---------------------------------------------------------
-    # 维度三：近 7 天活跃走势 (Activity Trend)
+    # 维度三：近 7 天【三合一】活跃走势 (Activity Trend)
     # ---------------------------------------------------------
     today = datetime.now().date()
     dates_list = [(today - timedelta(days=i)) for i in range(6, -1, -1)]
     dates_str = [d.strftime("%m-%d") for d in dates_list]
-    counts_dict = {d: 0 for d in dates_str}
 
-    # 拉取近 7 天的答题记录
+    # 建立三维字典容器
+    trend = {d: {"recognize": 0, "quiz": 0, "read": 0} for d in dates_str}
     start_date = today - timedelta(days=6)
-    history_records = db.query(models.ChallengeHistory.created_at).filter(
+
+    recs = db.query(models.RecognizeHistory.created_at).filter(
+        models.RecognizeHistory.user_id == user_id,
+        models.RecognizeHistory.created_at >= start_date
+    ).all()
+    quizzes = db.query(models.ChallengeHistory.created_at).filter(
         models.ChallengeHistory.user_id == user_id,
         models.ChallengeHistory.created_at >= start_date
     ).all()
+    reads = db.query(models.ReadingRecord.created_at).filter(
+        models.ReadingRecord.user_id == user_id,
+        models.ReadingRecord.created_at >= start_date
+    ).all()
 
-    # Python 内存聚合按天统计（完美避开不同数据库的 Date 兼容问题）
-    for record in history_records:
-        record_date_str = record[0].strftime("%m-%d")
-        if record_date_str in counts_dict:
-            counts_dict[record_date_str] += 1
-
-    activity_counts = [counts_dict[d] for d in dates_str]
+    for r in recs:
+        d = r[0].strftime("%m-%d")
+        if d in trend: trend[d]["recognize"] += 1
+    for q in quizzes:
+        d = q[0].strftime("%m-%d")
+        if d in trend: trend[d]["quiz"] += 1
+    for rd in reads:
+        d = rd[0].strftime("%m-%d")
+        if d in trend: trend[d]["read"] += 1
 
     # ---------------------------------------------------------
-    # 维度四：学习偏好 (Learning Habit) - 实践探索 vs 理论刷题
+    # 维度四：学习偏好 (Learning Habit)
     # ---------------------------------------------------------
-    # 统计拍照识别次数
     recognize_count = db.query(models.RecognizeHistory).filter(models.RecognizeHistory.user_id == user_id).count()
-    # 统计挑战答题次数
     quiz_count = db.query(models.ChallengeHistory).filter(models.ChallengeHistory.user_id == user_id).count()
+    read_count = db.query(models.ReadingRecord).filter(models.ReadingRecord.user_id == user_id).count()
 
-    preference_tag = "全能环保卫士"
-    if recognize_count > quiz_count * 1.5 and recognize_count >= 5:
-        preference_tag = "实践探索家"
-    elif quiz_count > recognize_count * 1.5 and quiz_count >= 5:
-        preference_tag = "理论小考神"
-    elif recognize_count == 0 and quiz_count == 0:
-        preference_tag = "环保小萌新"
+    total_actions = recognize_count + quiz_count + read_count
+    preference_tag = "环保小萌新"
+    if total_actions > 0:
+        if recognize_count / total_actions > 0.5:
+            preference_tag = "实践探索家"
+        elif quiz_count / total_actions > 0.5:
+            preference_tag = "理论小考神"
+        elif read_count / total_actions > 0.5:
+            preference_tag = "知识博学者"
+        else:
+            preference_tag = "全能环保卫士"
 
     # ---------------------------------------------------------
-    # 维度五：错题消化率 (Mistake Clearance)
+    # 维度五：错题深度分析 (Mistake Clearance & Distribution)
     # ---------------------------------------------------------
-    total_wrong = db.query(models.WrongBook).filter(models.WrongBook.user_id == user_id).count()
-    cleared_count = db.query(models.WrongBook).filter(models.WrongBook.user_id == user_id,
-                                                      models.WrongBook.status == 1).count()
+    valid_wrong_query = db.query(models.WrongBook).filter(
+        models.WrongBook.user_id == user_id,
+        models.WrongBook.is_deleted == False
+    )
+
+    total_wrong = valid_wrong_query.count()
+    cleared_count = valid_wrong_query.filter(models.WrongBook.status == 1).count()
 
     clear_rate = 0.0
     if total_wrong > 0:
         clear_rate = round(cleared_count / total_wrong, 2)
+    elif total_wrong == 0 and quiz_count > 0:
+        clear_rate = 1.0
+
+    # 错题分类分布数据
+    wrong_distribution = []
+    for c_id, c_name in category_map.items():
+        if c_id in stat_dict:
+            w_count = stat_dict[c_id].total_answered - stat_dict[c_id].correct_answered
+            if w_count > 0:
+                wrong_distribution.append({"name": c_name, "value": w_count})
 
     # ---------------------------------------------------------
     # 维度六：AI 智能教育评语引擎
     # ---------------------------------------------------------
+    activity_sum = sum(trend[d]["recognize"] + trend[d]["quiz"] + trend[d]["read"] for d in dates_str)
+
     if total_wrong == 0 and quiz_count > 0:
-        ai_comment = "太不可思议了！你的正确率高得惊人，没有任何错题，是完美的学霸！"
-    elif sum(activity_counts) == 0:
+        ai_comment = "太不可思议了！你的目前没有任何错题积压，是完美的环保学霸！"
+    elif activity_sum == 0:
         ai_comment = "最近几天都没有看到你的身影哦，环保习惯需要每天坚持，快来挑战一下吧！"
     elif highest_category["name"] == "综合" and lowest_category["name"] == "无":
         ai_comment = "你还没有积攒足够的答题数据哦，快去【答题闯关】或者【拍照识别】丰富你的档案吧！"
     else:
-        # 基于偏科数据的点评
         ai_comment = f"宝贝是【{highest_category['name']}】小达人！"
         if lowest_category["name"] != highest_category["name"] and lowest_category["acc"] < 0.6:
             ai_comment += f"但在分辨【{lowest_category['name']}】时容易掉进陷阱，属于偏科型选手，建议多复习一下错题本哦！"
@@ -2480,19 +2553,23 @@ async def get_growth_report(user_id: int, db: Session = Depends(get_db)):
                 "beat_percentage": beat_percentage
             },
             "radar_data": radar_data,
-            "activity_7_days": {
+            "activity_trend": {
                 "dates": dates_str,
-                "counts": activity_counts
+                "recognize": [trend[d]["recognize"] for d in dates_str],
+                "quiz": [trend[d]["quiz"] for d in dates_str],
+                "read": [trend[d]["read"] for d in dates_str]
             },
             "learning_habit": {
                 "recognize_count": recognize_count,
                 "quiz_count": quiz_count,
+                "read_count": read_count,
                 "preference_tag": preference_tag
             },
-            "mistake_clearance": {
+            "mistake_analysis": {
                 "cleared_count": cleared_count,
                 "total_wrong": total_wrong,
-                "clear_rate": clear_rate
+                "clear_rate": clear_rate,
+                "distribution": wrong_distribution
             },
             "ai_comment": ai_comment
         }
