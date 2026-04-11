@@ -2579,108 +2579,181 @@ async def get_growth_report(user_id: int, db: Session = Depends(get_db)):
 # ==========================================
 # 指导老师端专属 API 模块
 # ==========================================
-
 # --- 1. 班级学情大盘 (排行榜与高频错题) ---
 @app.get("/api/teacher/dashboard")
 async def get_teacher_dashboard(db: Session = Depends(get_db)):
-    # ---------------------------------------------------------
-    # 1. 光荣榜 (Top 10 学生) - 已加防火墙
-    # ---------------------------------------------------------
-    top_students = db.query(models.User).filter(
-        models.User.role == "student"
-    ).order_by(desc(models.User.total_score)).limit(10).all()
+    # 提前获取所有学生 ID，作为后续“抗偏移”计算的基础池
+    students = db.query(models.User.id, models.User.nickname, models.User.avatar_url, models.User.total_score,
+                        models.User.title) \
+        .filter(models.User.role == "student").all()
+    student_ids = [s.id for s in students]
 
+    # ---------------------------------------------------------
+    # 1. 光荣榜 (Top 10 学生)
+    # ---------------------------------------------------------
+    top_students = sorted(students, key=lambda x: x.total_score, reverse=True)[:10]
     leaderboard = [{
-        "id": u.id,
-        "nickname": u.nickname,
-        "avatar": u.avatar_url,
-        "score": u.total_score,
-        "title": u.title
+        "id": u.id, "nickname": u.nickname, "avatar": u.avatar_url,
+        "score": u.total_score, "title": u.title
     } for u in top_students]
 
     # ---------------------------------------------------------
-    # 2. 高频错题 Top 5 - 已加防火墙
+    # 2. [抗偏移] 共性易错知识点 Top 5 (按踩坑人数排，而非出错总数)
     # ---------------------------------------------------------
     top_mistakes = db.query(
         models.WrongBook.item_name,
         models.WrongBook.correct_answer,
-        func.count(models.WrongBook.id).label('err_count')
-    ).join(models.User, models.WrongBook.user_id == models.User.id) \
-        .filter(models.User.role == "student") \
+        func.count(func.distinct(models.WrongBook.user_id)).label('err_user_count')  # 👈 核心：distinct 去重
+    ).filter(models.WrongBook.user_id.in_(student_ids)) \
         .group_by(models.WrongBook.item_name, models.WrongBook.correct_answer) \
-        .order_by(desc('err_count')).limit(5).all()
+        .order_by(desc('err_user_count')).limit(5).all()
 
     mistakes_list = [{
         "item_name": m.item_name,
         "correct_answer": m.correct_answer,
-        "error_count": m.err_count
+        "error_count": m.err_user_count  # 现在代表的是踩坑“人数”
     } for m in top_mistakes]
 
     # ---------------------------------------------------------
-    # 3. [新增] 班级综合能力雷达图 (全班平均正确率)
+    # 3. [抗偏移] 分层雷达图 (全班分类达标率，假设及格线为 60%)
     # ---------------------------------------------------------
-    # SQL 逻辑：查询全班所有人在各个类别的答题总数和答对总数，求和
-    radar_stats = db.query(
-        models.UserCategoryStat.category_type,
-        func.sum(models.UserCategoryStat.total_answered).label('total_sum'),
-        func.sum(models.UserCategoryStat.correct_answered).label('correct_sum')
-    ).join(models.User, models.UserCategoryStat.user_id == models.User.id) \
-        .filter(models.User.role == "student") \
-        .group_by(models.UserCategoryStat.category_type).all()
-
     category_map = {1: "可回收物", 2: "有害垃圾", 3: "厨余垃圾", 4: "其他垃圾"}
+    all_stats = db.query(models.UserCategoryStat).filter(models.UserCategoryStat.user_id.in_(student_ids)).all()
+
+    category_pass_counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    category_active_users = {1: 0, 2: 0, 3: 0, 4: 0}
+
+    for stat in all_stats:
+        if stat.total_answered > 0:
+            category_active_users[stat.category_type] += 1
+            acc = stat.correct_answered / stat.total_answered
+            if acc >= 0.6:  # 👈 准确率 >= 60% 算作达标
+                category_pass_counts[stat.category_type] += 1
+
     class_radar = []
-
-    # 转换查询结果为字典方便读取
-    stat_dict = {s.category_type: s for s in radar_stats}
-
     for c_id, c_name in category_map.items():
-        acc = 0.0
-        if c_id in stat_dict and stat_dict[c_id].total_sum and stat_dict[c_id].total_sum > 0:
-            acc = round(stat_dict[c_id].correct_sum / stat_dict[c_id].total_sum, 2)
+        pass_rate = 0.0
+        if category_active_users[c_id] > 0:
+            pass_rate = category_pass_counts[c_id] / category_active_users[c_id]
 
         class_radar.append({
             "category_id": c_id,
             "name": c_name,
-            "accuracy": acc
+            "value": int(pass_rate * 100),  # 给前端的雷达图数值 (达标人数比例)
+            "accuracy": pass_rate
         })
 
     # ---------------------------------------------------------
-    # 4. [新增] 近 7 天班级学习活跃走势
+    # 4. [抗偏移] 双轴活跃走势 (堆叠总次数 + DAU活跃总人数)
     # ---------------------------------------------------------
     today = datetime.now().date()
     dates_list = [(today - timedelta(days=i)) for i in range(6, -1, -1)]
     dates_str = [d.strftime("%m-%d") for d in dates_list]
-    counts_dict = {d: 0 for d in dates_str}
-
     start_date = today - timedelta(days=6)
 
-    # 拉取全班学生的挑战(答题)记录
-    challenge_records = db.query(models.ChallengeHistory.created_at).join(
-        models.User, models.ChallengeHistory.user_id == models.User.id
-    ).filter(
-        models.User.role == "student",
-        models.ChallengeHistory.created_at >= start_date
-    ).all()
+    # 字典包含 active_users 集合，用于统计 DAU (日活人数)
+    trend = {d: {"recognize": 0, "quiz": 0, "read": 0, "active_users": set()} for d in dates_str}
 
-    # 拉取全班学生的拍照记录
-    recognize_records = db.query(models.RecognizeHistory.created_at).join(
-        models.User, models.RecognizeHistory.user_id == models.User.id
-    ).filter(
-        models.User.role == "student",
-        models.RecognizeHistory.created_at >= start_date
-    ).all()
+    recs = db.query(models.RecognizeHistory.created_at, models.RecognizeHistory.user_id).filter(
+        models.RecognizeHistory.user_id.in_(student_ids), models.RecognizeHistory.created_at >= start_date).all()
+    quizzes = db.query(models.ChallengeHistory.created_at, models.ChallengeHistory.user_id).filter(
+        models.ChallengeHistory.user_id.in_(student_ids), models.ChallengeHistory.created_at >= start_date).all()
+    reads = db.query(models.ReadingRecord.created_at, models.ReadingRecord.user_id).filter(
+        models.ReadingRecord.user_id.in_(student_ids), models.ReadingRecord.created_at >= start_date).all()
 
-    # 在内存中合并计算每天的总人次
-    all_records = challenge_records + recognize_records
-    for record in all_records:
-        record_date_str = record[0].strftime("%m-%d")
-        if record_date_str in counts_dict:
-            counts_dict[record_date_str] += 1
+    for r in recs:
+        d = r[0].strftime("%m-%d")
+        if d in trend:
+            trend[d]["recognize"] += 1;
+            trend[d]["active_users"].add(r[1])
+    for q in quizzes:
+        d = q[0].strftime("%m-%d")
+        if d in trend:
+            trend[d]["quiz"] += 1;
+            trend[d]["active_users"].add(q[1])
+    for rd in reads:
+        d = rd[0].strftime("%m-%d")
+        if d in trend:
+            trend[d]["read"] += 1;
+            trend[d]["active_users"].add(rd[1])
 
     class_activity = {
         "dates": dates_str,
-        "counts": [counts_dict[d] for d in dates_str]
+        "recognize": [trend[d]["recognize"] for d in dates_str],
+        "quiz": [trend[d]["quiz"] for d in dates_str],
+        "read": [trend[d]["read"] for d in dates_str],
+        "dau": [len(trend[d]["active_users"]) for d in dates_str]  # 👈 新增给前端折线图的 DAU 数组
+    }
+
+    # ---------------------------------------------------------
+    # 5. [抗偏移] 班级学习基因人群分布 (按人头统计偏好)
+    # ---------------------------------------------------------
+    user_actions = {uid: {"rec": 0, "quiz": 0, "read": 0} for uid in student_ids}
+
+    rec_c = db.query(models.RecognizeHistory.user_id, func.count(models.RecognizeHistory.id)).filter(
+        models.RecognizeHistory.user_id.in_(student_ids)).group_by(models.RecognizeHistory.user_id).all()
+    quiz_c = db.query(models.ChallengeHistory.user_id, func.count(models.ChallengeHistory.id)).filter(
+        models.ChallengeHistory.user_id.in_(student_ids)).group_by(models.ChallengeHistory.user_id).all()
+    read_c = db.query(models.ReadingRecord.user_id, func.count(models.ReadingRecord.id)).filter(
+        models.ReadingRecord.user_id.in_(student_ids)).group_by(models.ReadingRecord.user_id).all()
+
+    for uid, c in rec_c: user_actions[uid]["rec"] = c
+    for uid, c in quiz_c: user_actions[uid]["quiz"] = c
+    for uid, c in read_c: user_actions[uid]["read"] = c
+
+    habit_dist = {"实践探索派": 0, "理论小考神": 0, "知识博学者": 0, "全能卫士": 0, "暂无数据": 0}
+
+    for uid, actions in user_actions.items():
+        tot = actions["rec"] + actions["quiz"] + actions["read"]
+        if tot == 0:
+            habit_dist["暂无数据"] += 1
+        elif actions["rec"] / tot > 0.5:
+            habit_dist["实践探索派"] += 1
+        elif actions["quiz"] / tot > 0.5:
+            habit_dist["理论小考神"] += 1
+        elif actions["read"] / tot > 0.5:
+            habit_dist["知识博学者"] += 1
+        else:
+            habit_dist["全能卫士"] += 1
+
+    habit_pie = [{"name": k, "value": v} for k, v in habit_dist.items() if v > 0]
+
+    # ---------------------------------------------------------
+    # 6. [抗偏移] 错题歼灭战况分布图 (各个消化率区间的人数)
+    # ---------------------------------------------------------
+    wrong_stats = db.query(
+        models.WrongBook.user_id,
+        func.count(models.WrongBook.id).label("total"),
+        func.sum(models.WrongBook.status).label("cleared")  # 因为 status 为 0/1，sum 即为消灭数
+    ).filter(models.WrongBook.user_id.in_(student_ids), models.WrongBook.is_deleted == False) \
+        .group_by(models.WrongBook.user_id).all()
+
+    clearance_buckets = {"摆烂区\n(0-20%)": 0, "拖延区\n(21-59%)": 0, "良好区\n(60-89%)": 0, "清零区\n(≥90%)": 0}
+
+    total_class_wrong = 0
+    total_class_cleared = 0
+
+    for stat in wrong_stats:
+        uid, tot, cleared = stat
+        cleared = int(cleared) if cleared else 0
+        total_class_wrong += tot
+        total_class_cleared += cleared
+
+        if tot > 0:
+            rate = cleared / tot
+            if rate <= 0.2:
+                clearance_buckets["摆烂区\n(0-20%)"] += 1
+            elif rate < 0.6:
+                clearance_buckets["拖延区\n(21-59%)"] += 1
+            elif rate < 0.9:
+                clearance_buckets["良好区\n(60-89%)"] += 1
+            else:
+                clearance_buckets["清零区\n(≥90%)"] += 1
+
+    clearance_bar = {
+        "categories": list(clearance_buckets.keys()),
+        "values": list(clearance_buckets.values()),
+        "avg_rate": round(total_class_cleared / total_class_wrong, 2) if total_class_wrong > 0 else 1.0
     }
 
     # ---------------------------------------------------------
@@ -2692,8 +2765,10 @@ async def get_teacher_dashboard(db: Session = Depends(get_db)):
         "data": {
             "leaderboard": leaderboard,
             "top_mistakes": mistakes_list,
-            "class_radar": class_radar,  # 👈 新增给 ECharts 雷达图的数据
-            "class_activity": class_activity  # 👈 新增给 ECharts 折线图的数据
+            "class_radar": class_radar,  # 维度二：雷达图
+            "class_activity": class_activity,  # 维度一：双轴图 (含 dau)
+            "habit_pie": habit_pie,  # 维度三：人群画像饼图
+            "clearance_dist": clearance_bar  # 维度四：消化率区间柱状图
         }
     }
 
