@@ -14,6 +14,21 @@ class ConfigType(str, enum.Enum):
     banner = "banner"
     daily_tip = "daily_tip"
 
+# --- 0. 班级架构表 (新增) ---
+class SchoolClass(Base):
+    """
+    班级行政架构表，用于实现多班级数据域控隔离
+    """
+    __tablename__ = "school_classes"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    grade_name = Column(String(50), nullable=False, comment="年级名称，如：一年级")
+    class_name = Column(String(50), nullable=False, comment="班级名称，如：1班")
+    created_at = Column(DateTime, server_default=func.now())
+
+    # 方便反向查询：获取这个班级下的所有学生和奖品
+    users = relationship("User", back_populates="school_class")
+    mall_items = relationship("MallItem", back_populates="school_class")
 
 # --- 1. 用户表 ---
 class User(Base):
@@ -29,7 +44,11 @@ class User(Base):
     title = Column(String(50), default="环保新手", comment="当前环保称号")
     created_at = Column(DateTime, server_default=func.now(), comment="注册时间")
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), comment="最后更新时间")
+    # 关联到具体班级 (这里 nullable=True 允许新用户注册时先为空，再选择)
+    class_id = Column(Integer, ForeignKey("school_classes.id"), nullable=True, comment="所属班级ID")
 
+    # 关联属性，方便代码里直接用 user.school_class.grade_name
+    school_class = relationship("SchoolClass", back_populates="users")
     # 关联属性：方便通过 user.recognize_histories 直接获取该用户的所有历史记录
     recognize_histories = relationship("RecognizeHistory", back_populates="user")
     challenge_histories = relationship("ChallengeHistory", back_populates="user")
@@ -217,7 +236,11 @@ class MallItem(Base):
     desc = Column(String(200), comment="商品描述")
     points_price = Column(Integer, nullable=False, comment="兑换所需积分")
     image_url = Column(String(255), comment="商品图片")
+    # 将奖品与班级绑定，实现商城商品隔离
+    class_id = Column(Integer, ForeignKey("school_classes.id"), nullable=True, comment="所属班级ID(为空代表全校通用)")
 
+    # 反向关联
+    school_class = relationship("SchoolClass", back_populates="mall_items")
     # 库存设计：-1代表无限库存（如虚拟勋章），大于0代表实体商品真实库存
     stock = Column(Integer, default=-1, comment="库存数量")
 

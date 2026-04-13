@@ -176,6 +176,20 @@ async def get_admin_menu():
                 }
             },
             {
+                "path": "/schoolClass/index",
+                "name": "schoolClass",
+                "component": "/schoolClass/index",  # 👈 严格对应 src/views/schoolClass/index.vue
+                "meta": {
+                    "icon": "OfficeBuilding",
+                    "title": "班级架构配置",
+                    "isLink": "",
+                    "isHide": False,
+                    "isFull": False,
+                    "isAffix": False,
+                    "isKeepAlive": True
+                }
+            },
+            {
                 "path": "/garbage",
                 "name": "garbage",
                 "redirect": "/garbage/items",
@@ -626,7 +640,8 @@ async def get_admin_users(
     pageNum: int = Query(1, description="当前页码"),
     pageSize: int = Query(10, description="每页数量"),
     nickname: str = Query(None, description="搜索：用户昵称"),
-    role: str = Query(None, description="搜索：用户角色"),  # 接收前端传来的角色搜索词
+    role: str = Query(None, description="搜索：用户角色"),
+    class_id: int = Query(None, description="搜索：所属班级ID"),  # 核心修复 1：接收前端传来的 class_id
     db: Session = Depends(get_db)
 ):
     """
@@ -634,13 +649,17 @@ async def get_admin_users(
     """
     query = db.query(models.User)
 
-    # 支持按昵称模糊搜索
+    # 1. 支持按昵称模糊搜索
     if nickname:
         query = query.filter(models.User.nickname.like(f"%{nickname}%"))
 
-    # 支持按角色精准筛选
+    # 2. 支持按角色精准筛选
     if role:
         query = query.filter(models.User.role == role)
+
+    # 核心修复 2：支持按班级精准筛选
+    if class_id:
+        query = query.filter(models.User.class_id == class_id)
 
     total = query.count()
     skip = (pageNum - 1) * pageSize
@@ -648,16 +667,21 @@ async def get_admin_users(
 
     list_data = []
     for u in users:
+        # 获取班级名字
+        c_name = f"{u.school_class.grade_name} {u.school_class.class_name}" if u.school_class else "未分配"
+
         list_data.append({
             "id": u.id,
-            "openid": u.openid,  # 微信唯一标识
+            "openid": u.openid,
             "nickname": u.nickname or "微信用户",
             "avatar_url": u.avatar_url or "",
             "role": u.role,
-            "score": u.total_score ,  # 积分段位
+            "class_id": u.class_id,  # 顺手修复：返回 class_id，以便前端点击“编辑”时下拉框能自动选中当前班级
+            "class_info": c_name,
+            "title": u.title,
+            "score": u.total_score,
             "eco_coin": u.eco_coin,
-            "title": u.title if hasattr(u, 'title') and u.title else "环保新手",
-            "created_at": u.created_at.strftime("%Y-%m-%d %H:%M:%S") if u.created_at else ""
+            "created_at": u.created_at.strftime("%Y-%m-%d") if u.created_at else ""
         })
 
     return {
@@ -716,6 +740,30 @@ async def get_notifications(db: Session = Depends(get_db)):
         }
     }
 
+
+# ==============================================================================
+# 后台管理系统 - 班级管理模块
+# ==============================================================================
+from pydantic import BaseModel
+class AdminClassSchema(BaseModel):
+    grade_name: str
+    class_name: str
+
+# 1. 管理员获取所有班级列表
+@app.get("/api/admin/classes")
+async def get_admin_classes(db: Session = Depends(get_db)):
+    classes = db.query(models.SchoolClass).all()
+    # 拼装给前端
+    list_data = [{"id": c.id, "grade_name": c.grade_name, "class_name": c.class_name} for c in classes]
+    return {"code": 200, "message": "成功", "data": list_data}
+
+# 2. 管理员新增班级
+@app.post("/api/admin/classes")
+async def add_admin_class(req: AdminClassSchema, db: Session = Depends(get_db)):
+    new_class = models.SchoolClass(grade_name=req.grade_name, class_name=req.class_name)
+    db.add(new_class)
+    db.commit()
+    return {"code": 200, "message": "班级添加成功"}
 
 # --- 数据校验 Schema ---
 class AuditLowConfidenceSchema(BaseModel):
@@ -1002,7 +1050,11 @@ class WxRegisterRequest(BaseModel):
     invite_code: Optional[str] = None  # 选填，但如果是 teacher 则必填
     nickname: str = "微信用户"
     avatar_url: str = ""
+    class_id: int = 1
 
+class UpdateClassSchema(BaseModel):
+    user_id: int
+    class_id: int
 
 # ==========================================
 # 接口：微信静默登录
@@ -1031,15 +1083,18 @@ def wechat_login(request_data: schemas.WxLoginRequest, db: Session = Depends(get
 
     if user:
         # 老用户，静默登录成功
+        grade_name = user.school_class.grade_name if user.school_class else "未分配"
+        class_name = user.school_class.class_name if user.school_class else ""
         return {
             "code": 200,
             "message": "静默登录成功",
             "data": {
                 "id": user.id,
                 "openid": user.openid,
-                "role": user.role,  # 前端将根据这个 role 决定进入学生版还是教师版
+                "role": user.role,
                 "nickname": user.nickname,
-                "avatar_url": user.avatar_url
+                "avatar_url": user.avatar_url,
+                "full_class_name": f"{grade_name} {class_name}".strip()  # 拼好给前端展示
             }
         }
     else:
@@ -1087,7 +1142,8 @@ def wechat_register(req: WxRegisterRequest, db: Session = Depends(get_db)):
         openid=req.openid,
         role=req.role,
         nickname=req.nickname,
-        avatar_url=req.avatar_url
+        avatar_url=req.avatar_url,
+        class_id=req.class_id  # 新增入库
     )
     db.add(new_user)
     db.commit()
@@ -1099,16 +1155,43 @@ def wechat_register(req: WxRegisterRequest, db: Session = Depends(get_db)):
         invite_record.used_by = new_user.id
         db.commit()
 
+    # 5. 手动拼接班级名称返回给前端
+    # 这里访问 new_user.school_class 会自动触发 SQLAlchemy 去班级表里查名字
+    grade_name = new_user.school_class.grade_name if new_user.school_class else "未分配"
+    class_name = new_user.school_class.class_name if new_user.school_class else ""
+    full_name = f"{grade_name} {class_name}".strip()
+
+    # 组装完整的数据包返回
     return {
         "code": 200,
         "message": "注册成功！欢迎加入",
         "data": {
             "id": new_user.id,
+            "openid": new_user.openid,  # 顺手补齐，保持和 login 接口一致
             "role": new_user.role,
-            "nickname": new_user.nickname
+            "nickname": new_user.nickname,
+            "avatar_url": new_user.avatar_url,  # 顺手补齐
+            "full_class_name": full_name
         }
     }
 
+
+# 修改班级的专属接口
+@app.post("/api/user/update_class")
+def update_user_class(req: UpdateClassSchema, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == req.user_id).first()
+    if not user: return {"code": 404, "message": "用户不存在"}
+
+    user.class_id = req.class_id
+    db.commit()
+
+    # 重新查一遍返回最新的班级名称
+    db.refresh(user)
+    return {
+        "code": 200,
+        "message": "班级修改成功",
+        "data": {"full_class_name": f"{user.school_class.grade_name} {user.school_class.class_name}"}
+    }
 # ==========================================
 # 处理每日任务积分奖励与防刷校验
 # ==========================================
@@ -2155,10 +2238,14 @@ async def delete_feedback_history(item_id: int, db: Session = Depends(get_db)):
 
 # 排行榜接口
 @app.get("/api/leaderboard")
-def get_leaderboard(db: Session = Depends(get_db)):
-    # 👇 核心修复：加上 role == 'student' 过滤，严防老师霸榜
+def get_leaderboard(user_id: int = Query(...), db: Session = Depends(get_db)): # 👈 新增入参
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    target_class_id = user.class_id if user else 1
+
+    # 只排同班同学的
     top_users = db.query(models.User).filter(
-        models.User.role == "student"
+        models.User.role == "student",
+        models.User.class_id == target_class_id
     ).order_by(models.User.total_score.desc()).limit(10).all()
 
     result = []
@@ -2243,10 +2330,15 @@ class RedeemSchema(BaseModel):
 # 小程序接口：获取商城在售商品列表
 # ==========================================
 @app.get("/api/mall/items")
-async def get_mall_items(db: Session = Depends(get_db)):
-    # 只查处于上架状态的商品
-    items = db.query(models.MallItem).filter(models.MallItem.is_active == True).order_by(
-        models.MallItem.points_price.asc()).all()
+async def get_mall_items(user_id: int = Query(...), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    target_class_id = user.class_id if user else 1
+
+    # is_active=True 且 (商品属于本班 OR 商品属于系统(1))
+    items = db.query(models.MallItem).filter(
+        models.MallItem.is_active == True,
+        (models.MallItem.class_id == target_class_id) | (models.MallItem.class_id == 1)
+    ).order_by(models.MallItem.points_price.asc()).all()
 
     result = []
     for item in items:
@@ -2581,11 +2673,16 @@ async def get_growth_report(user_id: int, db: Session = Depends(get_db)):
 # ==========================================
 # --- 1. 班级学情大盘 (排行榜与高频错题) ---
 @app.get("/api/teacher/dashboard")
-async def get_teacher_dashboard(db: Session = Depends(get_db)):
-    # 提前获取所有学生 ID，作为后续“抗偏移”计算的基础池
+async def get_teacher_dashboard(teacher_id: int = Query(...), db: Session = Depends(get_db)):
+    # 获取老师所在的班级
+    teacher = db.query(models.User).filter(models.User.id == teacher_id).first()
+    target_class_id = teacher.class_id if teacher else 1
+
+    # 仅仅查询这个班级里的学生！
     students = db.query(models.User.id, models.User.nickname, models.User.avatar_url, models.User.total_score,
                         models.User.title) \
-        .filter(models.User.role == "student").all()
+        .filter(models.User.role == "student", models.User.class_id == target_class_id).all()
+
     student_ids = [s.id for s in students]
 
     # ---------------------------------------------------------
@@ -2775,11 +2872,17 @@ async def get_teacher_dashboard(db: Session = Depends(get_db)):
 
 # --- 2. 获取待核销(待发奖)的订单列表 ---
 @app.get("/api/teacher/pending_orders")
-async def get_pending_orders(db: Session = Depends(get_db)):
-    # 查询所有 status == 0 (待发放) 的兑换记录
-    # 按时间正序排列（先申请的先处理）
-    orders = db.query(models.RedemptionRecord).filter(models.RedemptionRecord.status == 0).order_by(
-        models.RedemptionRecord.created_at.asc()).all()
+async def get_pending_orders(teacher_id: int = Query(...), db: Session = Depends(get_db)):
+    teacher = db.query(models.User).filter(models.User.id == teacher_id).first()
+    target_class_id = teacher.class_id if teacher else 1
+
+    # 只查 user.class_id 等于老师 class_id 的订单
+    orders = db.query(models.RedemptionRecord).join(
+        models.User, models.RedemptionRecord.user_id == models.User.id
+    ).filter(
+        models.RedemptionRecord.status == 0,
+        models.User.class_id == target_class_id  # 隔离过滤
+    ).order_by(models.RedemptionRecord.created_at.asc()).all()
 
     res_list = []
     for order in orders:
@@ -2860,10 +2963,7 @@ async def upload_common_image(file: UploadFile = File(...)):
 # --- 老师发布新奖品 ---
 @app.post("/api/teacher/mall/add")
 async def add_mall_item(item_data: schemas.MallItemCreate, db: Session = Depends(get_db)):
-    # 检查是否有权限
     teacher = db.query(models.User).filter(models.User.id == item_data.teacher_id).first()
-    if not teacher or teacher.role != "teacher":
-        return {"code": 403, "message": "权限不足，只有老师可以发布奖品"}
 
     new_item = models.MallItem(
         name=item_data.name,
@@ -2871,7 +2971,8 @@ async def add_mall_item(item_data: schemas.MallItemCreate, db: Session = Depends
         points_price=item_data.points_price,
         image_url=item_data.image_url,
         stock=item_data.stock,
-        created_by=item_data.teacher_id
+        created_by=item_data.teacher_id,
+        class_id=teacher.class_id  # 商品归属到老师的班级
     )
     db.add(new_item)
     db.commit()
@@ -2880,9 +2981,19 @@ async def add_mall_item(item_data: schemas.MallItemCreate, db: Session = Depends
 
 # --- 老师管理奖品列表（包含下架功能） ---
 @app.get("/api/teacher/mall/list")
-async def get_teacher_mall_items(db: Session = Depends(get_db)):
-    # 老师可以看到所有奖品，并进行管理
-    items = db.query(models.MallItem).order_by(models.MallItem.created_at.desc()).all()
+async def get_teacher_mall_items(
+        teacher_id: int = Query(..., description="当前操作的老师ID"),  # 1. 强制要求传入老师 ID
+        db: Session = Depends(get_db)
+):
+    # 2. 获取该老师所在的班级
+    teacher = db.query(models.User).filter(models.User.id == teacher_id).first()
+    target_class_id = teacher.class_id if teacher else 1
+
+    # 3. 核心滤镜：只查询所属班级是该老师班级的奖品
+    items = db.query(models.MallItem).filter(
+        models.MallItem.class_id == target_class_id
+    ).order_by(models.MallItem.created_at.desc()).all()
+
     return {"code": 200, "data": items}
 
 
@@ -2895,3 +3006,36 @@ async def toggle_mall_item(item_id: int, db: Session = Depends(get_db)):
     item.is_active = not item.is_active
     db.commit()
     return {"code": 200, "message": "操作成功", "new_status": item.is_active}
+
+
+# ==========================================
+# 通用接口：获取 年级-班级 级联字典树
+# ==========================================
+@app.get("/api/common/class_options")
+async def get_class_options(db: Session = Depends(get_db)):
+    classes = db.query(models.SchoolClass).all()
+
+    # 将扁平数据按 grade_name 分组组合成树状结构
+    grade_dict = {}
+    for c in classes:
+        # 跳过系统默认的隐藏班级（ID为1的系统测试班，不给普通用户选）
+        if c.id == 1:
+            continue
+
+        if c.grade_name not in grade_dict:
+            grade_dict[c.grade_name] = []
+
+        grade_dict[c.grade_name].append({
+            "id": c.id,
+            "name": c.class_name
+        })
+
+    # 格式化为前端 Picker 容易解析的数组
+    result = []
+    for grade, cls_list in grade_dict.items():
+        result.append({
+            "grade_name": grade,
+            "classes": cls_list
+        })
+
+    return {"code": 200, "message": "获取成功", "data": result}
