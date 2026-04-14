@@ -238,7 +238,7 @@ class MallItem(Base):
     image_url = Column(String(255), comment="商品图片")
     # 将奖品与班级绑定，实现商城商品隔离
     class_id = Column(Integer, ForeignKey("school_classes.id"), nullable=True, comment="所属班级ID(为空代表全校通用)")
-
+    is_deleted = Column(Boolean, default=False, comment="是否已彻底删除")
     # 反向关联
     school_class = relationship("SchoolClass", back_populates="mall_items")
     # 库存设计：-1代表无限库存（如虚拟勋章），大于0代表实体商品真实库存
@@ -306,3 +306,19 @@ class ReadingRecord(Base):
     created_at = Column(DateTime, server_default=func.now(), comment="阅读时间")
 
     user = relationship("User")
+
+# --- 13. 通知表 ---
+from sqlalchemy import Column, Integer, String, Boolean, DateTime
+from datetime import datetime
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True, comment="接收通知的用户ID")
+    type = Column(String(50), comment="通知类型")
+    content = Column(String(255), comment="通知内容")
+    is_read = Column(Boolean, default=False, comment="是否已读")
+    created_at = Column(DateTime, default=datetime.now, comment="发布时间")
+    # 🚀 新增：过期时间字段，用于控制生效时长
+    expires_at = Column(DateTime, nullable=True, comment="过期时间(空为永久)")

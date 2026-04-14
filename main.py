@@ -1,32 +1,122 @@
 import requests
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, File, UploadFile, Form
 from sqlalchemy.orm import Session
-from fastapi import File, UploadFile, Form, Depends
-import os
 from sqlalchemy.sql.expression import func
 from sqlalchemy import desc
+import os
 import random
-from datetime import datetime,date
-from fastapi.middleware.cors import CORSMiddleware
-
-# 模型
 import io
+import uuid
+from datetime import datetime, date, timedelta
+from typing import List
+from contextlib import asynccontextmanager
+from pydantic import BaseModel
+
+# AI 框架
 import torch
 import torch.nn as nn
 import torchvision.models as tv_models
 import torchvision.transforms as transforms
 from PIL import Image
 
+# 定时任务
+from apscheduler.schedulers.background import BackgroundScheduler
+
 # 导入写好的模块
 import models, schemas
-from database import engine, get_db
+from database import engine, get_db, SessionLocal
 from cos_utils import upload_file_to_cos
-import uuid
+from fastapi.middleware.cors import CORSMiddleware
 
-# 保险，不会重复建表
+# 保险，会自动根据模型建表
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="智能垃圾分类小程序 API", version="1.2")
+
+# ==========================================
+# 👑 核心逻辑：每周排行榜结算函数 (含通知发放)
+# ==========================================
+def run_weekly_settlement():
+    # 因为定时任务不在 FastAPI 的 HTTP 请求上下文中，需要手动开启独立数据库会话
+    db = SessionLocal()
+    try:
+        print("⏰ 开始执行：每周排行榜结算自动化任务...")
+
+        # 1. 获取全班排名前 3 的学生（按环保星 total_score 降序）
+        top_students = db.query(models.User).filter(
+            models.User.role == "student"
+        ).order_by(models.User.total_score.desc()).limit(3).all()
+
+        if not top_students:
+            print("⚠️ 没有找到学生数据，跳过结算。")
+            return
+
+        # 2. 设定前三名的奖励梯度（小红花）
+        rewards = [50, 30, 10]
+        titles = ["榜首", "榜眼", "探花"]
+
+        for i, student in enumerate(top_students):
+            reward_coin = rewards[i]
+            rank_title = titles[i]
+
+            # A. 给学生增加小红花
+            student.eco_coin += reward_coin
+
+            # B. 写入积分流水记录
+            new_record = models.PointRecord(
+                user_id=student.id,
+                task_type=99,  # 99 代表“排行榜系统发奖”
+                points=reward_coin,
+                description=f"上周排行榜【{rank_title}】荣誉奖励"
+            )
+            db.add(new_record)
+
+            # C. 🚀 关键：同步发送首页通知
+            new_notice = models.Notification(
+                user_id=student.id,
+                type="reward",
+                content=f"恭喜！你获得了上周排行榜【{rank_title}】，系统奖励了 {reward_coin} 朵小红花，快去商城看看吧！"
+            )
+            db.add(new_notice)
+
+            print(f"👑 已向 {student.nickname} ({rank_title}) 发放奖励及通知")
+
+        db.commit()
+        print("✅ 每周排行榜结算及通知发放圆满完成！")
+
+    except Exception as e:
+        print(f"❌ 结算失败: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+# ==========================================
+# 🚀 新版生命周期管理器 Lifespan (替换 on_event)
+# ==========================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 【启动时执行】
+    scheduler = BackgroundScheduler()
+    # 设定：每周一 (mon) 凌晨 00:00 自动执行
+    scheduler.add_job(run_weekly_settlement, 'cron', day_of_week='mon', hour=0, minute=0)
+    scheduler.start()
+    print("🕰️ APScheduler 定时任务引擎已启动 (Lifespan 模式)。")
+
+    yield  # 这里是应用运行的时间
+
+    # 【关闭时执行】
+    scheduler.shutdown()
+    print("🛑 APScheduler 定时任务引擎已安全关闭。")
+
+
+# ==========================================
+# 实例化 FastAPI (带上 lifespan)
+# ==========================================
+app = FastAPI(
+    title="智能垃圾分类小程序 API",
+    version="1.3",
+    lifespan=lifespan
+)
 
 # ==========================================
 # 配置 CORS 跨域
@@ -1763,6 +1853,21 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
         return {"code": 404, "message": "用户不存在"}
 
     # ==========================================
+    # 后端防抖与防重复交卷拦截
+    # ==========================================
+    # 检查该用户在过去 5 秒内，是否提交过完全相同的成绩
+    five_seconds_ago = datetime.now() - timedelta(seconds=5)
+    duplicate_record = db.query(models.ChallengeHistory).filter(
+        models.ChallengeHistory.user_id == quiz_data.user_id,
+        models.ChallengeHistory.correct_count == quiz_data.correct_count,
+        models.ChallengeHistory.total_count == quiz_data.total_count,
+        models.ChallengeHistory.created_at >= five_seconds_ago
+    ).first()
+
+    if duplicate_record:
+        # 如果 5 秒内查到了同样的记录，说明是网络延迟导致的连击，直接驳回！
+        return {"code": 400, "message": "请勿频繁重复交卷哦"}
+    # ==========================================
     # 根据双模式规则，后端权威计算得分
     # ==========================================
     calculated_score = 0
@@ -1770,22 +1875,41 @@ async def submit_challenge(quiz_data: schemas.QuizSubmitRequest, db: Session = D
     current_performance = "再接再厉"
 
     if quiz_data.mode == "timed":
-        # 【计时模式】基础星 1
+        # 基础奖励：只要参与并交卷，固定获得 1 颗环保星
         base_score = 1
         bonus = 0
-        time_ratio = quiz_data.time_used / quiz_data.total_time if quiz_data.total_time > 0 else 1.0
 
-        if accuracy == 1.0 and time_ratio <= 0.6:
-            bonus = 2  # 全对且极快，额外拿2星
-            current_performance = "闪电小超人"
-        elif accuracy >= 0.8 and quiz_data.time_used <= quiz_data.total_time:
-            bonus = 1
-            current_performance = "极速小达人"
-        elif accuracy >= 0.5:
-            current_performance = "游刃有余"
+        # 计算核心判定指标
+        is_on_time = quiz_data.time_used <= quiz_data.total_time
+        accuracy = quiz_data.correct_count / quiz_data.total_count if quiz_data.total_count > 0 else 0
+        progress = quiz_data.total_count / 25  # 假设限时模式目标总题数为 25
+
+        # 🚀 场景化评价引擎
+        if is_on_time:
+            if accuracy >= 0.8:
+                # 场景 1：按时完成且正确率高
+                bonus = 3
+                current_performance = "手速王者"
+            else:
+                # 场景 2：按时完成但正确率不高
+                bonus = 2
+                current_performance = "极速达人"
         else:
-            current_performance = "再接再厉"
+            if progress >= 0.6:
+                if accuracy >= 0.8:
+                    # 场景 3：未按时完成，但答题大半且正确率高
+                    bonus = 1
+                    current_performance = "沉稳小将"
+                else:
+                    # 场景 4：未按时完成，答题大半，但正确率不高
+                    bonus = 0
+                    current_performance = "游刃有余"
+            else:
+                # 场景 5：未按时完成且答题未过半
+                bonus = 0
+                current_performance = "眼疾手快"
 
+        # 最终得分 = 基础1星 + 加成星
         calculated_score = base_score + bonus
 
     else:
@@ -2334,10 +2458,11 @@ async def get_mall_items(user_id: int = Query(...), db: Session = Depends(get_db
     user = db.query(models.User).filter(models.User.id == user_id).first()
     target_class_id = user.class_id if user else 1
 
-    # is_active=True 且 (商品属于本班 OR 商品属于系统(1))
+    # 🚀 核心修改：增加 is_deleted == False 过滤条件，屏蔽被删除的商品
     items = db.query(models.MallItem).filter(
         models.MallItem.is_active == True,
-        (models.MallItem.class_id == target_class_id) | (models.MallItem.class_id == 1)
+        models.MallItem.is_deleted == False,  # 👈 关键点：排除已逻辑删除的商品
+        ((models.MallItem.class_id == target_class_id) | (models.MallItem.class_id == 1))
     ).order_by(models.MallItem.points_price.asc()).all()
 
     result = []
@@ -2672,21 +2797,23 @@ async def get_growth_report(user_id: int, db: Session = Depends(get_db)):
 # 指导老师端专属 API 模块
 # ==========================================
 # --- 1. 班级学情大盘 (排行榜与高频错题) ---
+# --- 1. 班级学情大盘 (排行榜与高频错题) ---
 @app.get("/api/teacher/dashboard")
 async def get_teacher_dashboard(teacher_id: int = Query(...), db: Session = Depends(get_db)):
-    # 获取老师所在的班级
     teacher = db.query(models.User).filter(models.User.id == teacher_id).first()
     target_class_id = teacher.class_id if teacher else 1
 
-    # 仅仅查询这个班级里的学生！
     students = db.query(models.User.id, models.User.nickname, models.User.avatar_url, models.User.total_score,
                         models.User.title) \
         .filter(models.User.role == "student", models.User.class_id == target_class_id).all()
 
     student_ids = [s.id for s in students]
 
+    # 🚀 核心修改：提前建立 UID 到 姓名的映射，供所有图表提取名字！
+    uid_to_name = {u.id: u.nickname for u in students}
+
     # ---------------------------------------------------------
-    # 1. 光荣榜 (Top 10 学生)
+    # 1. 光荣榜
     # ---------------------------------------------------------
     top_students = sorted(students, key=lambda x: x.total_score, reverse=True)[:10]
     leaderboard = [{
@@ -2695,24 +2822,20 @@ async def get_teacher_dashboard(teacher_id: int = Query(...), db: Session = Depe
     } for u in top_students]
 
     # ---------------------------------------------------------
-    # 2. [抗偏移] 共性易错知识点 Top 5 (按踩坑人数排，而非出错总数)
+    # 2. 高频错题 Top 5
     # ---------------------------------------------------------
     top_mistakes = db.query(
-        models.WrongBook.item_name,
-        models.WrongBook.correct_answer,
-        func.count(func.distinct(models.WrongBook.user_id)).label('err_user_count')  # 👈 核心：distinct 去重
+        models.WrongBook.item_name, models.WrongBook.correct_answer,
+        func.count(func.distinct(models.WrongBook.user_id)).label('err_user_count')
     ).filter(models.WrongBook.user_id.in_(student_ids)) \
         .group_by(models.WrongBook.item_name, models.WrongBook.correct_answer) \
         .order_by(desc('err_user_count')).limit(5).all()
 
-    mistakes_list = [{
-        "item_name": m.item_name,
-        "correct_answer": m.correct_answer,
-        "error_count": m.err_user_count  # 现在代表的是踩坑“人数”
-    } for m in top_mistakes]
+    mistakes_list = [{"item_name": m.item_name, "correct_answer": m.correct_answer, "error_count": m.err_user_count} for
+                     m in top_mistakes]
 
     # ---------------------------------------------------------
-    # 3. [抗偏移] 分层雷达图 (全班分类达标率，假设及格线为 60%)
+    # 3. 分层雷达图
     # ---------------------------------------------------------
     category_map = {1: "可回收物", 2: "有害垃圾", 3: "厨余垃圾", 4: "其他垃圾"}
     all_stats = db.query(models.UserCategoryStat).filter(models.UserCategoryStat.user_id.in_(student_ids)).all()
@@ -2723,32 +2846,22 @@ async def get_teacher_dashboard(teacher_id: int = Query(...), db: Session = Depe
     for stat in all_stats:
         if stat.total_answered > 0:
             category_active_users[stat.category_type] += 1
-            acc = stat.correct_answered / stat.total_answered
-            if acc >= 0.6:  # 👈 准确率 >= 60% 算作达标
+            if (stat.correct_answered / stat.total_answered) >= 0.6:
                 category_pass_counts[stat.category_type] += 1
 
     class_radar = []
     for c_id, c_name in category_map.items():
-        pass_rate = 0.0
-        if category_active_users[c_id] > 0:
-            pass_rate = category_pass_counts[c_id] / category_active_users[c_id]
-
-        class_radar.append({
-            "category_id": c_id,
-            "name": c_name,
-            "value": int(pass_rate * 100),  # 给前端的雷达图数值 (达标人数比例)
-            "accuracy": pass_rate
-        })
+        pass_rate = category_pass_counts[c_id] / category_active_users[c_id] if category_active_users[c_id] > 0 else 0.0
+        class_radar.append({"category_id": c_id, "name": c_name, "value": int(pass_rate * 100), "accuracy": pass_rate})
 
     # ---------------------------------------------------------
-    # 4. [抗偏移] 双轴活跃走势 (堆叠总次数 + DAU活跃总人数)
+    # 4. 双轴活跃走势 (包含 DAU 活跃名单)
     # ---------------------------------------------------------
     today = datetime.now().date()
     dates_list = [(today - timedelta(days=i)) for i in range(6, -1, -1)]
     dates_str = [d.strftime("%m-%d") for d in dates_list]
     start_date = today - timedelta(days=6)
 
-    # 字典包含 active_users 集合，用于统计 DAU (日活人数)
     trend = {d: {"recognize": 0, "quiz": 0, "read": 0, "active_users": set()} for d in dates_str}
 
     recs = db.query(models.RecognizeHistory.created_at, models.RecognizeHistory.user_id).filter(
@@ -2760,30 +2873,31 @@ async def get_teacher_dashboard(teacher_id: int = Query(...), db: Session = Depe
 
     for r in recs:
         d = r[0].strftime("%m-%d")
-        if d in trend:
-            trend[d]["recognize"] += 1;
-            trend[d]["active_users"].add(r[1])
+        if d in trend: trend[d]["recognize"] += 1; trend[d]["active_users"].add(r[1])
     for q in quizzes:
         d = q[0].strftime("%m-%d")
-        if d in trend:
-            trend[d]["quiz"] += 1;
-            trend[d]["active_users"].add(q[1])
+        if d in trend: trend[d]["quiz"] += 1; trend[d]["active_users"].add(q[1])
     for rd in reads:
         d = rd[0].strftime("%m-%d")
-        if d in trend:
-            trend[d]["read"] += 1;
-            trend[d]["active_users"].add(rd[1])
+        if d in trend: trend[d]["read"] += 1; trend[d]["active_users"].add(rd[1])
+
+    # 🚀 核心修改：打包 DAU 具体名单给前端
+    dau_names = []
+    for d in dates_str:
+        names = [uid_to_name.get(uid, f"学生{uid}") for uid in trend[d]["active_users"]]
+        dau_names.append(names)
 
     class_activity = {
         "dates": dates_str,
         "recognize": [trend[d]["recognize"] for d in dates_str],
         "quiz": [trend[d]["quiz"] for d in dates_str],
         "read": [trend[d]["read"] for d in dates_str],
-        "dau": [len(trend[d]["active_users"]) for d in dates_str]  # 👈 新增给前端折线图的 DAU 数组
+        "dau": [len(trend[d]["active_users"]) for d in dates_str],
+        "dau_names": dau_names  # 👈 传给前端的名单
     }
 
     # ---------------------------------------------------------
-    # 5. [抗偏移] 班级学习基因人群分布 (按人头统计偏好)
+    # 5. 班级学习基因人群分布 (名单)
     # ---------------------------------------------------------
     user_actions = {uid: {"rec": 0, "quiz": 0, "read": 0} for uid in student_ids}
 
@@ -2798,34 +2912,36 @@ async def get_teacher_dashboard(teacher_id: int = Query(...), db: Session = Depe
     for uid, c in quiz_c: user_actions[uid]["quiz"] = c
     for uid, c in read_c: user_actions[uid]["read"] = c
 
-    habit_dist = {"实践探索派": 0, "理论小考神": 0, "知识博学者": 0, "全能卫士": 0, "暂无数据": 0}
+    # 🚀 核心修改：改为存放名单列表
+    habit_groups = {"实践探索派": [], "理论小考神": [], "知识博学者": [], "全能卫士": [], "暂无数据": []}
 
     for uid, actions in user_actions.items():
         tot = actions["rec"] + actions["quiz"] + actions["read"]
+        nickname = uid_to_name.get(uid, f"学生{uid}")
         if tot == 0:
-            habit_dist["暂无数据"] += 1
+            habit_groups["暂无数据"].append(nickname)
         elif actions["rec"] / tot > 0.5:
-            habit_dist["实践探索派"] += 1
+            habit_groups["实践探索派"].append(nickname)
         elif actions["quiz"] / tot > 0.5:
-            habit_dist["理论小考神"] += 1
+            habit_groups["理论小考神"].append(nickname)
         elif actions["read"] / tot > 0.5:
-            habit_dist["知识博学者"] += 1
+            habit_groups["知识博学者"].append(nickname)
         else:
-            habit_dist["全能卫士"] += 1
+            habit_groups["全能卫士"].append(nickname)
 
-    habit_pie = [{"name": k, "value": v} for k, v in habit_dist.items() if v > 0]
+    habit_pie = [{"name": k, "value": len(v), "students": v} for k, v in habit_groups.items() if len(v) > 0]
 
     # ---------------------------------------------------------
-    # 6. [抗偏移] 错题歼灭战况分布图 (各个消化率区间的人数)
+    # 6. 错题歼灭战况分布图 (名单)
     # ---------------------------------------------------------
     wrong_stats = db.query(
-        models.WrongBook.user_id,
-        func.count(models.WrongBook.id).label("total"),
-        func.sum(models.WrongBook.status).label("cleared")  # 因为 status 为 0/1，sum 即为消灭数
-    ).filter(models.WrongBook.user_id.in_(student_ids), models.WrongBook.is_deleted == False) \
-        .group_by(models.WrongBook.user_id).all()
+        models.WrongBook.user_id, func.count(models.WrongBook.id).label("total"),
+        func.sum(models.WrongBook.status).label("cleared")
+    ).filter(models.WrongBook.user_id.in_(student_ids), models.WrongBook.is_deleted == False).group_by(
+        models.WrongBook.user_id).all()
 
-    clearance_buckets = {"摆烂区\n(0-20%)": 0, "拖延区\n(21-59%)": 0, "良好区\n(60-89%)": 0, "清零区\n(≥90%)": 0}
+    # 🚀 核心修改：改为存放名单列表
+    clearance_buckets = {"摆烂区\n(0-20%)": [], "拖延区\n(21-59%)": [], "良好区\n(60-89%)": [], "清零区\n(≥90%)": []}
 
     total_class_wrong = 0
     total_class_cleared = 0
@@ -2836,39 +2952,37 @@ async def get_teacher_dashboard(teacher_id: int = Query(...), db: Session = Depe
         total_class_wrong += tot
         total_class_cleared += cleared
 
+        name = uid_to_name.get(uid, f"学生{uid}")
+
         if tot > 0:
             rate = cleared / tot
             if rate <= 0.2:
-                clearance_buckets["摆烂区\n(0-20%)"] += 1
+                clearance_buckets["摆烂区\n(0-20%)"].append(name)
             elif rate < 0.6:
-                clearance_buckets["拖延区\n(21-59%)"] += 1
+                clearance_buckets["拖延区\n(21-59%)"].append(name)
             elif rate < 0.9:
-                clearance_buckets["良好区\n(60-89%)"] += 1
+                clearance_buckets["良好区\n(60-89%)"].append(name)
             else:
-                clearance_buckets["清零区\n(≥90%)"] += 1
+                clearance_buckets["清零区\n(≥90%)"].append(name)
 
     clearance_bar = {
         "categories": list(clearance_buckets.keys()),
-        "values": list(clearance_buckets.values()),
+        "values": [len(v) for v in clearance_buckets.values()],
+        "students": list(clearance_buckets.values()),  # 👈 传给前端的名单
         "avg_rate": round(total_class_cleared / total_class_wrong, 2) if total_class_wrong > 0 else 1.0
     }
 
-    # ---------------------------------------------------------
-    # 组装返回数据
-    # ---------------------------------------------------------
     return {
-        "code": 200,
-        "message": "获取大盘数据成功",
+        "code": 200, "message": "获取大盘数据成功",
         "data": {
             "leaderboard": leaderboard,
             "top_mistakes": mistakes_list,
-            "class_radar": class_radar,  # 维度二：雷达图
-            "class_activity": class_activity,  # 维度一：双轴图 (含 dau)
-            "habit_pie": habit_pie,  # 维度三：人群画像饼图
-            "clearance_dist": clearance_bar  # 维度四：消化率区间柱状图
+            "class_radar": class_radar,
+            "class_activity": class_activity,
+            "habit_pie": habit_pie,
+            "clearance_dist": clearance_bar
         }
     }
-
 
 # --- 2. 获取待核销(待发奖)的订单列表 ---
 @app.get("/api/teacher/pending_orders")
@@ -2982,16 +3096,17 @@ async def add_mall_item(item_data: schemas.MallItemCreate, db: Session = Depends
 # --- 老师管理奖品列表（包含下架功能） ---
 @app.get("/api/teacher/mall/list")
 async def get_teacher_mall_items(
-        teacher_id: int = Query(..., description="当前操作的老师ID"),  # 1. 强制要求传入老师 ID
+        teacher_id: int = Query(..., description="当前操作的老师ID"),
         db: Session = Depends(get_db)
 ):
     # 2. 获取该老师所在的班级
     teacher = db.query(models.User).filter(models.User.id == teacher_id).first()
     target_class_id = teacher.class_id if teacher else 1
 
-    # 3. 核心滤镜：只查询所属班级是该老师班级的奖品
+    # 3. 🚀 核心修改：只查询所属班级是该老师班级，并且【未被逻辑删除】的奖品
     items = db.query(models.MallItem).filter(
-        models.MallItem.class_id == target_class_id
+        models.MallItem.class_id == target_class_id,
+        models.MallItem.is_deleted == False  # 👈 关键点：不在库房中显示已删除的商品
     ).order_by(models.MallItem.created_at.desc()).all()
 
     return {"code": 200, "data": items}
@@ -3007,6 +3122,49 @@ async def toggle_mall_item(item_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"code": 200, "message": "操作成功", "new_status": item.is_active}
 
+
+# ==========================================
+# 物理删除已下架的商品 (带未核销保护锁)
+# ==========================================
+@app.delete("/api/teacher/mall/items/{item_id}")
+async def delete_off_shelf_item(item_id: int, teacher_id: int = Query(...), db: Session = Depends(get_db)):
+    # 1. 权限校验
+    user = db.query(models.User).filter(models.User.id == teacher_id).first()
+    if not user or user.role != "teacher":
+        return {"code": 403, "message": "权限不足"}
+
+    # 2. 查找商品
+    item = db.query(models.MallItem).filter(models.MallItem.id == item_id).first()
+    if not item or item.is_deleted:
+        return {"code": 404, "message": "找不到该商品或已被删除"}
+
+    # 3. 必须先下架
+    if item.is_active:
+        return {
+            "code": 400,
+            "message": "删除失败！当前商品处于【上架中】状态，请先下架。"
+        }
+
+    # 4. 🚀 核心精准修复：使用真实的 RedemptionRecord 表，且 status == 0 代表待核销
+    pending_count = db.query(models.RedemptionRecord).filter(
+        models.RedemptionRecord.item_id == item_id,
+        models.RedemptionRecord.status == 0  # 0:待核销(未发货)
+    ).count()
+
+    if pending_count > 0:
+        return {
+            "code": 400,
+            "message": f"删除拦截：还有 {pending_count} 名学生兑换了该商品但【未核销】，请先完成核销发放后再删除！"
+        }
+
+    # 5. 执行逻辑删除，而非物理删除
+    try:
+        item.is_deleted = True  # 打上删除标记，数据依然留在数据库保护历史记录
+        db.commit()
+        return {"code": 200, "message": "商品已从库房永久移除"}
+    except Exception as e:
+        db.rollback()
+        return {"code": 500, "message": f"操作失败: {str(e)}"}
 
 # ==========================================
 # 通用接口：获取 年级-班级 级联字典树
@@ -3039,3 +3197,113 @@ async def get_class_options(db: Session = Depends(get_db)):
         })
 
     return {"code": 200, "message": "获取成功", "data": result}
+
+
+# ==========================================
+# 首页通知系统新增接口
+# ==========================================
+from sqlalchemy import or_, desc
+# 1. 获取用户的未读通知
+@app.get("/api/user/notifications")
+async def get_notifications(user_id: int, db: Session = Depends(get_db)):
+    now = datetime.now()
+
+    # 🚀 核心查询：找该用户的、未读的、且（没过期 或者 永久有效）的通知
+    notices = db.query(models.Notification).filter(
+        models.Notification.user_id == user_id,
+        models.Notification.is_read == False,
+        or_(models.Notification.expires_at == None, models.Notification.expires_at > now)
+    ).order_by(desc(models.Notification.created_at)).all()
+
+    # 打包返回，顺便把时间格式化为 '04-14 10:30' 的友好格式供前端展示
+    result = [{
+        "id": n.id,
+        "type": n.type,
+        "content": n.content,
+        "created_at": n.created_at.strftime("%m-%d %H:%M")
+    } for n in notices]
+
+    return {"code": 200, "data": result}
+
+# 2. 将通知标为已读
+@app.post("/api/user/notifications/{notice_id}/read")
+async def read_notification(notice_id: int, db: Session = Depends(get_db)):
+    notice = db.query(models.Notification).filter(models.Notification.id == notice_id).first()
+    if notice:
+        notice.is_read = True
+        db.commit()
+    return {"code": 200, "message": "已标为已读"}
+
+
+# ==========================================
+# 接口：获取班级学生名单 (供老师发通知下拉框使用)
+# ==========================================
+@app.get("/api/teacher/students")
+async def get_teacher_students(teacher_id: int, db: Session = Depends(get_db)):
+    teacher = db.query(models.User).filter(models.User.id == teacher_id).first()
+    target_class_id = teacher.class_id if teacher else 1
+
+    students = db.query(models.User.id, models.User.nickname).filter(
+        models.User.role == "student",
+        models.User.class_id == target_class_id
+    ).all()
+
+    # 第一项固定塞入群发选项
+    data = [{"id": 0, "name": "📢 广播：全体学生"}] + [{"id": s.id, "name": f"👤 {s.nickname}"} for s in students]
+    return {"code": 200, "data": data}
+
+
+# ==========================================
+# 接口：老师发送通知 (支持群发和单发)
+# ==========================================
+class SendNoticeSchema(BaseModel):
+    user_id: int    # 0 代表发给全体，非 0 代表单个学生
+    type: str       # 通知类型 (如: '日常提醒', '任务布置', '奖励通报')
+    duration: int   # 生效时长(单位:小时)，传 0 代表永久
+    content: str    # 通知内容
+
+
+@app.post("/api/teacher/send_notice")
+async def send_teacher_notice(req: SendNoticeSchema, teacher_id: int = Query(...), db: Session = Depends(get_db)):
+    # 🚀 1. 计算过期时间
+    expire_time = None
+    if req.duration > 0:
+        expire_time = datetime.now() + timedelta(hours=req.duration)
+
+    if req.user_id == 0:
+        # 🚀 2. 群发逻辑：找出老师对应班级的所有学生
+        teacher = db.query(models.User).filter(models.User.id == teacher_id).first()
+        target_class_id = teacher.class_id if teacher else 1
+        students = db.query(models.User.id).filter(
+            models.User.role == "student",
+            models.User.class_id == target_class_id
+        ).all()
+
+        notices = [
+            models.Notification(
+                user_id=s.id,
+                type=req.type,
+                content=req.content,
+                expires_at=expire_time
+            ) for s in students
+        ]
+        db.bulk_save_objects(notices)
+    else:
+        # 🚀 3. 单发逻辑
+        new_notice = models.Notification(
+            user_id=req.user_id,
+            type=req.type,
+            content=req.content,
+            expires_at=expire_time
+        )
+        db.add(new_notice)
+
+    db.commit()
+    return {"code": 200, "message": "通知已送达学生"}
+
+
+# 4. 手动触发周榜奖励 (方便你答辩演示)
+@app.post("/api/teacher/trigger_weekly_reward")
+async def trigger_reward():
+    run_weekly_settlement()
+    return {"code": 200, "message": "结算完成，奖励与通知已下发"}
