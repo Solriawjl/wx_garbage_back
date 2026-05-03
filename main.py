@@ -31,57 +31,73 @@ from fastapi.middleware.cors import CORSMiddleware
 # 保险，会自动根据模型建表
 models.Base.metadata.create_all(bind=engine)
 
-
 # ==========================================
-# 👑 核心逻辑：每周排行榜结算函数 (含通知发放)
+# 👑 核心逻辑：每周排行榜结算函数 (按班级独立结算)
 # ==========================================
 def run_weekly_settlement():
     # 因为定时任务不在 FastAPI 的 HTTP 请求上下文中，需要手动开启独立数据库会话
     db = SessionLocal()
     try:
-        print("⏰ 开始执行：每周排行榜结算自动化任务...")
+        print("⏰ 开始执行：每周班级排行榜结算自动化任务...")
 
-        # 1. 获取全班排名前 3 的学生（按环保星 total_score 降序）
-        top_students = db.query(models.User).filter(
-            models.User.role == "student"
-        ).order_by(models.User.total_score.desc()).limit(3).all()
+        # 1. 🚀 获取所有存在的班级（这里使用你在 models 中定义的 SchoolClass）
+        all_classes = db.query(models.SchoolClass).all()
 
-        if not top_students:
-            print("⚠️ 没有找到学生数据，跳过结算。")
+        if not all_classes:
+            print("⚠️ 没有找到任何班级数据，跳过结算。")
             return
 
-        # 2. 设定前三名的奖励梯度（小红花）
-        rewards = [50, 30, 10]
+        # 设定前三名的奖励梯度（小红花）
+        rewards = [30, 25, 20]
         titles = ["榜首", "榜眼", "探花"]
 
-        for i, student in enumerate(top_students):
-            reward_coin = rewards[i]
-            rank_title = titles[i]
+        # 2. 🚀 外层循环：遍历每一个班级
+        for school_class in all_classes:
+            class_id = school_class.id
+            class_name = f"{school_class.grade_name}{school_class.class_name}"
 
-            # A. 给学生增加小红花
-            student.eco_coin += reward_coin
+            print(f"📊 正在结算班级 [{class_name}] (ID: {class_id}) ...")
 
-            # B. 写入积分流水记录
-            new_record = models.PointRecord(
-                user_id=student.id,
-                task_type=99,  # 99 代表“排行榜系统发奖”
-                points=reward_coin,
-                description=f"上周排行榜【{rank_title}】荣誉奖励"
-            )
-            db.add(new_record)
+            # 3. 🚀 内层查询：获取当前班级排名前 3 的学生
+            top_students = db.query(models.User).filter(
+                models.User.role == "student",
+                models.User.class_id == class_id  # 严格限定班级范围
+            ).order_by(models.User.total_score.desc()).limit(3).all()
 
-            # C. 🚀 关键：同步发送首页通知
-            new_notice = models.Notification(
-                user_id=student.id,
-                type="reward",
-                content=f"恭喜！你获得了上周排行榜【{rank_title}】，系统奖励了 {reward_coin} 朵小红花，快去商城看看吧！"
-            )
-            db.add(new_notice)
+            if not top_students:
+                print(f"   - 班级 [{class_name}] 暂无学生数据，跳过。")
+                continue
 
-            print(f"👑 已向 {student.nickname} ({rank_title}) 发放奖励及通知")
+            # 4. 为该班级的前三名发放奖励
+            for i, student in enumerate(top_students):
+                reward_coin = rewards[i]
+                rank_title = titles[i]
 
+                # A. 给学生增加小红花
+                student.eco_coin += reward_coin
+
+                # B. 写入积分流水记录
+                new_record = models.PointRecord(
+                    user_id=student.id,
+                    task_type=99,  # 99 代表“排行榜系统发奖”
+                    change_amount=reward_coin,
+                    description=f"上周【班级排行榜】{rank_title}荣誉奖励"
+                )
+                db.add(new_record)
+
+                # C. 同步发送首页通知
+                new_notice = models.Notification(
+                    user_id=student.id,
+                    type="reward",
+                    content=f"恭喜！你获得了上周班级排行榜【{rank_title}】，系统奖励了 {reward_coin} 朵小红花，快去商城兑换奖品吧！"
+                )
+                db.add(new_notice)
+
+                print(f"   👑 已向 {student.nickname} ({rank_title}) 发放 {reward_coin} 朵小红花")
+
+        # 所有班级遍历完成后，统一提交事务
         db.commit()
-        print("✅ 每周排行榜结算及通知发放圆满完成！")
+        print("✅ 所有班级的每周排行榜结算及通知发放圆满完成！")
 
     except Exception as e:
         print(f"❌ 结算失败: {e}")
@@ -987,7 +1003,7 @@ class AdminMallItemSchema(BaseModel):
     image_url: str
     stock: int
     is_active: bool
-
+    class_id: int = 1
 
 # --- 1. 获取商品列表 (带分页和搜索) ---
 @app.get("/api/admin/mall/items")
@@ -995,11 +1011,21 @@ async def get_admin_mall_items(
         pageNum: int = Query(1),
         pageSize: int = Query(10),
         name: str = Query(None),
+        class_id: int = Query(None, description="按班级ID筛选"),  # 👈 新增筛选参数
         db: Session = Depends(get_db)
 ):
     query = db.query(models.MallItem)
+
+    # 顺手把逻辑删除过滤加上，后台不应该看到已被彻底删掉的商品
+    if hasattr(models.MallItem, 'is_deleted'):
+        query = query.filter(models.MallItem.is_deleted == False)
+
     if name:
         query = query.filter(models.MallItem.name.like(f"%{name}%"))
+
+    # 👈 新增：如果前端传了班级，就严格过滤
+    if class_id:
+        query = query.filter(models.MallItem.class_id == class_id)
 
     total = query.count()
     skip = (pageNum - 1) * pageSize
@@ -1007,6 +1033,11 @@ async def get_admin_mall_items(
 
     list_data = []
     for i in items:
+        # 解析班级名称
+        class_name = "全校公共"
+        if i.class_id != 1 and i.school_class:
+            class_name = f"{i.school_class.grade_name}{i.school_class.class_name}"
+
         list_data.append({
             "id": i.id,
             "name": i.name,
@@ -1015,6 +1046,8 @@ async def get_admin_mall_items(
             "image_url": i.image_url,
             "stock": i.stock,
             "is_active": i.is_active,
+            "class_id": i.class_id,  # 返回原始ID，供编辑弹窗回显使用
+            "class_name": class_name,  # 返回中文名，供表格展示
             "created_at": i.created_at.strftime("%Y-%m-%d %H:%M:%S") if i.created_at else ""
         })
 
