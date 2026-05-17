@@ -2083,6 +2083,10 @@ async def get_user_info(user_id: int, db: Session = Depends(get_db)):
     if not user:
         return {"code": 404, "message": "用户不存在", "data": None}
 
+    grade_name = user.school_class.grade_name if user.school_class else "未分配"
+    class_name = user.school_class.class_name if user.school_class else ""
+    full_class_name = f"{grade_name} {class_name}".strip()
+
     # 加上 is_deleted == False，保证用户主页的统计数字和列表里看到的一致
     recognize_count = db.query(models.RecognizeHistory).filter(
         models.RecognizeHistory.user_id == user_id,
@@ -2101,9 +2105,12 @@ async def get_user_info(user_id: int, db: Session = Depends(get_db)):
             "eco_coin": user.eco_coin,
             "title": user.title,
             "recognize_count": recognize_count,
-            "challenge_count": challenge_count
+            "challenge_count": challenge_count,
+            "class_id": user.class_id,
+            "full_class_name": full_class_name
         }
     }
+
 
 
 # 2. 获取识别历史列表
